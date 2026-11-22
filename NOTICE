@@ -1,0 +1,43 @@
+Spotifast
+Copyright (c) 2026 Carmine Paolino
+Licensed under the MIT License (see LICENSE).
+
+Lossless Library Sync (`crates/spotisync` and Spotifast sync integration)
+-------------------------------------------------------------------------
+
+The `crates/spotisync` workspace crate and its integration in Spotifast
+(`src/sync_bridge.rs`, `src/local_player.rs`, and related settings, credential,
+and UI modules) are original, clean-room MIT-licensed implementations written
+from observed public provider HTTP API behaviour.
+
+No LGPL-3.0 or GPL-licensed code was copied from SpotiFLAC, streamrip, or any
+other third-party downloader. Both projects are acknowledged solely as
+conceptual inspiration for lossless playlist archiving workflows.
+
+Spotify Premium remains required for Spotify playback. Nothing in Spotifast or
+`spotisync` circumvents DRM, extracts keys from Spotify, or redistributes
+Spotify binaries.
+
+Key crates.io dependencies introduced for `crates/spotisync`
+------------------------------------------------------------
+
+All crates in `crates/spotisync/Cargo.toml` come from crates.io under
+permissive licenses compatible with MIT:
+
+- `rusqlite` (0.32, MIT License) with the `bundled` feature via
+  `libsqlite3-sys` (MIT License), which statically compiles SQLite
+  (Public Domain).
+- `lofty` (0.25, MIT OR Apache-2.0 License) for pure-Rust FLAC stream property
+  inspection, Vorbis comment tagging, and embedded cover picture blocks.
+- `async-trait` (0.1, MIT OR Apache-2.0 License) for async trait objects on
+  `Provider` and `PlaylistSource`.
+- `bytes` (1, MIT License) for zero-copy HTTP audio payload buffers.
+- `tempfile` (3, MIT OR Apache-2.0 License, dev-dependency) for isolated test
+  directories.
+
+`crates/spotisync` also reuses crates already present in the Spotifast
+workspace (`http`, `log`, `md-5`, `rand`, `reqwest`, `serde`, `serde_json`,
+`thiserror`, and `tokio`), all under MIT or dual MIT / Apache-2.0 licenses.
+Track title and artist fuzzy matching (Jaro-Winkler and normalized Levenshtein)
+is implemented directly inside `crates/spotisync/src/matching.rs` with no
+additional string-similarity crate.
