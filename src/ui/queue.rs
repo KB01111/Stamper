@@ -130,6 +130,8 @@ pub fn side_panel(app: &mut App, ui: &mut egui::Ui) {
             |ui| match app.queue_tab {
                 QueueTab::Queue => contents(app, ui, true),
                 QueueTab::Recents => recents_contents(app, ui),
+                // Placeholder until ui-dev implements the Sync tab view.
+                QueueTab::Sync => {}
             },
         );
     });
@@ -279,6 +281,8 @@ pub fn fullscreen_column(app: &mut App, ui: &mut egui::Ui) {
         |ui| match app.queue_tab {
             QueueTab::Queue => contents(app, ui, true),
             QueueTab::Recents => recents_contents(app, ui),
+            // Placeholder until ui-dev implements the Sync tab view.
+            QueueTab::Sync => {}
         },
     );
 }

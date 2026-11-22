@@ -13,7 +13,13 @@ use std::path::{Path, PathBuf};
 /// the single-instance files a running installed copy holds locked and the
 /// logs of its runs.
 const FOLDERS: fastframe_dirs::App = fastframe_dirs::App {
-    not_copied: &["instance", "spotifast.log", "panic.log"],
+    not_copied: &[
+        "instance",
+        "spotifast.log",
+        "panic.log",
+        "sync.db-wal",
+        "sync.db-shm",
+    ],
     ..fastframe_dirs::App::new("spotifast", "me", "paolino", "spotifast")
 };
 
@@ -159,6 +165,11 @@ impl AppDirs {
     /// cannot tell us later. See [`crate::history`].
     pub fn history_file(&self) -> PathBuf {
         self.state.join("history.json")
+    }
+
+    /// Resumable SQLite database tracking lossless playlist sync state.
+    pub fn sync_db_file(&self) -> PathBuf {
+        self.state.join("sync.db")
     }
 
     pub fn shared_web_token_file(&self) -> PathBuf {

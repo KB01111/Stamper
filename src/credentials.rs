@@ -30,16 +30,20 @@ pub enum Slot {
     Playback,
     Proxy,
     Soloist,
+    Qobuz,
+    Tidal,
 }
 
 impl Slot {
     pub const SPOTIFY: [Self; 3] = [Self::Shared, Self::Personal, Self::Playback];
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::Shared,
         Self::Personal,
         Self::Playback,
         Self::Proxy,
         Self::Soloist,
+        Self::Qobuz,
+        Self::Tidal,
     ];
     pub(crate) fn index(self) -> usize {
         self as usize
@@ -51,6 +55,8 @@ impl Slot {
             Self::Playback => "playback",
             Self::Proxy => "proxy-password",
             Self::Soloist => "soloist-key",
+            Self::Qobuz => "qobuz",
+            Self::Tidal => "tidal",
         }
     }
 }
@@ -62,6 +68,22 @@ pub enum Grant {
     Playback(Credentials),
     Proxy(ProxyPassword),
     Soloist(crate::soloist::Key),
+    Qobuz(QobuzGrant),
+}
+
+/// Deliberately has no Debug implementation: contains usable Qobuz API credentials.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QobuzGrant {
+    pub app_id: String,
+    pub user_auth_token: String,
+    #[serde(default)]
+    pub app_secret: Option<String>,
+}
+
+impl QobuzGrant {
+    pub fn valid(&self) -> bool {
+        !self.app_id.trim().is_empty() && !self.user_auth_token.trim().is_empty()
+    }
 }
 
 /// No Debug implementation: the password is usable, and the username is private.
@@ -105,6 +127,7 @@ impl Grant {
             }
             (Slot::Proxy, Self::Proxy(password)) => password.valid(),
             (Slot::Soloist, Self::Soloist(key)) => key.valid(),
+            (Slot::Qobuz, Self::Qobuz(qobuz)) => qobuz.valid(),
             _ => false,
         }
     }
@@ -584,7 +607,7 @@ type Job = Box<dyn FnOnce(&mut dyn ProtectedStore) + Send>;
 struct Inner {
     dirs: AppDirs,
     profile: String,
-    generations: [AtomicU64; 5],
+    generations: [AtomicU64; Slot::ALL.len()],
     // Held only around the tiny local marker files, never a native store call.
     markers: Mutex<()>,
     jobs: mpsc::SyncSender<Job>,
@@ -759,6 +782,27 @@ impl Store {
         error.map_or(Ok(()), Err)
     }
 
+    /// Loads saved Qobuz credentials from the protected store, if present.
+    pub async fn load_qobuz(&self) -> Result<Option<QobuzGrant>, Error> {
+        let loaded = self.lease(Slot::Qobuz).load().await?;
+        match loaded.grant {
+            Some(Grant::Qobuz(grant)) => Ok(Some(grant)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Saves Qobuz credentials in the protected store under `Slot::Qobuz`.
+    pub async fn save_qobuz(&self, grant: QobuzGrant) -> Result<(), Error> {
+        self.invalidate(Slot::Qobuz);
+        self.lease(Slot::Qobuz).save(Grant::Qobuz(grant)).await
+    }
+
+    /// Revokes and deletes saved Qobuz credentials without affecting Spotify slots.
+    pub async fn clear_qobuz(&self) -> Result<(), Error> {
+        self.revoke(Slot::Qobuz)?;
+        self.lease(Slot::Qobuz).delete().await
+    }
+
     fn marker_path(&self, slot: Slot) -> PathBuf {
         self.inner
             .dirs
@@ -793,7 +837,7 @@ impl Store {
     }
 
     fn legacy_paths(&self, slot: Slot) -> Vec<PathBuf> {
-        if slot == Slot::Soloist {
+        if matches!(slot, Slot::Soloist | Slot::Qobuz | Slot::Tidal) {
             return Vec::new();
         }
         if slot == Slot::Proxy {
@@ -806,7 +850,9 @@ impl Store {
             Slot::Personal => dirs.personal_web_token_file(),
             Slot::Playback => dirs.credentials_dir().join("credentials.json"),
             Slot::Proxy => unreachable!("proxy legacy paths handled above"),
-            Slot::Soloist => unreachable!("Soloist has no legacy files"),
+            Slot::Soloist | Slot::Qobuz | Slot::Tidal => {
+                unreachable!("slot has no legacy files")
+            }
         };
         let mut paths = vec![path.clone(), path.with_extension("json.tmp")];
         if slot != Slot::Playback {
@@ -1449,6 +1495,7 @@ mod tests {
             Grant::Playback(credentials) => serde_json::to_vec(credentials).unwrap(),
             Grant::Proxy(password) => password.password.as_bytes().to_vec(),
             Grant::Soloist(_) => panic!("Soloist has no legacy format"),
+            Grant::Qobuz(_) => panic!("Qobuz has no legacy format"),
         };
         std::fs::write(path, bytes).unwrap();
     }
@@ -2142,5 +2189,69 @@ mod tests {
                 Err(Error::Invalid)
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn qobuz_grant_round_trips_and_clears() {
+        let f = Fixture::new();
+        assert!(f.store.load_qobuz().await.unwrap().is_none());
+
+        let grant = QobuzGrant {
+            app_id: "123456789".into(),
+            user_auth_token: "dummy-qobuz-token".into(),
+            app_secret: Some("dummy-qobuz-secret".into()),
+        };
+        assert!(grant.valid());
+        f.store.save_qobuz(grant.clone()).await.unwrap();
+
+        let loaded = f.restart().load_qobuz().await.unwrap();
+        assert!(loaded.as_ref() == Some(&grant));
+
+        f.store.clear_qobuz().await.unwrap();
+        assert!(f.restart().load_qobuz().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn revoke_spotify_preserves_qobuz_grant() {
+        let f = Fixture::new();
+        let qobuz = QobuzGrant {
+            app_id: "987654321".into(),
+            user_auth_token: "dummy-qobuz-token-keep".into(),
+            app_secret: None,
+        };
+        f.store
+            .lease(Slot::Shared)
+            .save(web(SHARED_CLIENT))
+            .await
+            .unwrap();
+        f.store
+            .lease(Slot::Playback)
+            .save(playback())
+            .await
+            .unwrap();
+        f.store.save_qobuz(qobuz.clone()).await.unwrap();
+
+        f.store.revoke_spotify().unwrap();
+
+        let restarted = f.restart();
+        assert!(
+            restarted
+                .lease(Slot::Shared)
+                .load()
+                .await
+                .unwrap()
+                .grant
+                .is_none()
+        );
+        assert!(
+            restarted
+                .lease(Slot::Playback)
+                .load()
+                .await
+                .unwrap()
+                .grant
+                .is_none()
+        );
+        assert!(restarted.load_qobuz().await.unwrap().as_ref() == Some(&qobuz));
     }
 }

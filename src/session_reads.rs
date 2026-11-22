@@ -1917,6 +1917,12 @@ fn playable(kind: ExtensionKind, bytes: &[u8]) -> Option<PlayableItem> {
 }
 
 fn track(track: SessionTrack) -> Track {
+    let isrc = track
+        .external_ids
+        .iter()
+        .find(|ext| ext.external_type.eq_ignore_ascii_case("isrc"))
+        .map(|ext| ext.id.trim().to_string())
+        .filter(|id| !id.is_empty());
     Track {
         id: Some(track.id.to_id()),
         uri: track.id.to_uri(),
@@ -1928,6 +1934,7 @@ fn track(track: SessionTrack) -> Track {
         track_number: Some(u32::try_from(track.number).unwrap_or_default()),
         disc_number: Some(u32::try_from(track.disc_number).unwrap_or_default()),
         popularity: Some(track.popularity.clamp(0, 100) as u8),
+        external_ids: crate::api::models::ExternalIds { isrc },
         ..Default::default()
     }
 }

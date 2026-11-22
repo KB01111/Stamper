@@ -846,6 +846,21 @@ impl Engine {
         let _ = self.spirc.shutdown();
     }
 
+    /// Pauses librespot playback cleanly when currently playing (for example,
+    /// before starting direct local FLAC playback).
+    pub fn pause_if_playing(&self) {
+        self.stop_carrying();
+        let playing = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .playback
+            == Playback::Playing;
+        if playing {
+            let _ = self.spirc.pause();
+        }
+    }
+
     pub fn resume_point(&self) -> Option<PlaybackResume> {
         if let Some(snapshot) = self.spirc.disconnected_playback() {
             return Some(PlaybackResume::Session(snapshot));

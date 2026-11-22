@@ -377,6 +377,8 @@ fn central(app: &mut App, ui: &mut egui::Ui) {
                             Page::Show(id) => show::show(app, ui, &id),
                             Page::Radio(seed) => radio::radio(app, ui, &seed),
                             Page::Queue => queue::page(app, ui),
+                            // Placeholder until ui-dev implements the full sync views.
+                            Page::SyncedLibrary | Page::SyncQueue => {}
                             Page::Settings => settings::show(app, ui),
                         }
                     });
