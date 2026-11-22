@@ -508,6 +508,13 @@ fn now_playing_block(app: &mut App, ui: &mut egui::Ui, region: Rect, now: Option
     let heart_width = if now.is_episode { 0.0 } else { 42.0 };
     let text_left = cover_rect.right() + 12.0;
     let text_width = (region.right() - text_left - heart_width).max(40.0);
+    let flac_badge_width = super::sync::player_bar_badge_label(app).map_or(0.0, |label| {
+        ui.painter()
+            .layout_no_wrap(label, theme::semibold(10.5), palette.accent)
+            .size()
+            .x
+            + 18.0
+    });
     let displayed_text_width: f32 = {
         let title =
             ui.painter()
@@ -517,7 +524,9 @@ fn now_playing_block(app: &mut App, ui: &mut egui::Ui, region: Rect, now: Option
             theme::regular(12.0),
             palette.secondary,
         );
-        title.size().x.max(subtitle.size().x).min(text_width)
+        (title.size().x + flac_badge_width)
+            .max(subtitle.size().x)
+            .min(text_width)
     };
     let info_rect = Rect::from_min_size(pos2(text_left, cy - 18.0), vec2(text_width, 36.0));
 
@@ -528,8 +537,17 @@ fn now_playing_block(app: &mut App, ui: &mut egui::Ui, region: Rect, now: Option
     );
     text_ui.set_clip_rect(info_rect.intersect(ui.clip_rect()));
     text_ui.spacing_mut().item_spacing.y = 2.0;
-    let title_response = theme::link(&mut text_ui, &now.title, theme::medium(14.0), palette.text)
-        .interact(drag_sense);
+    let title_response = text_ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let resp =
+                theme::link(ui, &now.title, theme::medium(14.0), palette.text).interact(drag_sense);
+            if app.local_flac.active {
+                super::sync::player_bar_lossless_badge(app, ui);
+            }
+            resp
+        })
+        .inner;
     if title_response.clicked() {
         if let Some(id) = &now.album_id {
             app.actions.push(Action::Open(Page::Album(id.clone())));

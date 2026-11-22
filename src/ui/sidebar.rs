@@ -1006,6 +1006,17 @@ fn nav_row(
     label: &str,
     active: bool,
 ) -> egui::Response {
+    nav_row_with_badge(ui, palette, icon, label, active, None)
+}
+
+fn nav_row_with_badge(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    icon: Icon,
+    label: &str,
+    active: bool,
+    badge: Option<&str>,
+) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::click());
     if ui.is_rect_visible(rect) {
         let color = if active || response.hovered() {
@@ -1023,6 +1034,25 @@ fn nav_row(
             theme::bold(15.0),
             color,
         );
+        if let Some(badge) = badge {
+            let galley = ui.painter().layout_no_wrap(
+                badge.to_string(),
+                theme::semibold(11.0),
+                palette.on_accent,
+            );
+            let pill_size = vec2((galley.size().x + 12.0).max(20.0), 18.0);
+            let pill_rect = Rect::from_center_size(
+                pos2(rect.right() - pill_size.x / 2.0 - 8.0, rect.center().y),
+                pill_size,
+            );
+            ui.painter()
+                .rect_filled(pill_rect, pill_size.y / 2.0, palette.accent);
+            ui.painter().galley(
+                pill_rect.center() - galley.size() / 2.0,
+                galley,
+                palette.on_accent,
+            );
+        }
     }
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), active, label)
@@ -1059,6 +1089,33 @@ fn contents(app: &mut App, ui: &mut egui::Ui, grid_art: Option<Rect>) {
     .clicked()
     {
         app.actions.push(Action::FocusSearch);
+    }
+    if nav_row(
+        ui,
+        &palette,
+        Icon::Disc,
+        &gettext(locale, "Synced Library"),
+        page == Page::SyncedLibrary,
+    )
+    .clicked()
+    {
+        app.actions.push(Action::Open(Page::SyncedLibrary));
+    }
+    let sync_active_badge = app.sync_state.active_running.then(|| {
+        let snap = &app.sync_state.snapshot;
+        (snap.pending + snap.resolving + snap.downloading).to_string()
+    });
+    if nav_row_with_badge(
+        ui,
+        &palette,
+        Icon::Refresh,
+        &gettext(locale, "Sync Queue"),
+        page == Page::SyncQueue,
+        sync_active_badge.as_deref(),
+    )
+    .clicked()
+    {
+        app.actions.push(Action::Open(Page::SyncQueue));
     }
     ui.add_space(10.0);
     ui.painter().hline(
