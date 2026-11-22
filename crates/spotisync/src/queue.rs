@@ -724,7 +724,7 @@ impl SyncQueue {
             Err(_) => return,
         };
         if let Ok(snapshot) = build_snapshot(&self.store, &live) {
-            let _ = self.snapshot_tx.send(snapshot);
+            self.snapshot_tx.send_replace(snapshot);
         }
     }
 }
