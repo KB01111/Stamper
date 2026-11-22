@@ -18,7 +18,7 @@ use thiserror::Error;
 
 pub use matching::{MatchConfig, MatchOutcome, MatchedBy, RejectReason};
 pub use providers::{Provider, qobuz::QobuzConfig, qobuz::QobuzCredentials, qobuz::QobuzProvider};
-pub use queue::{ProviderCooldown, QueueConfig, SyncQueue, SyncSnapshot};
+pub use queue::{ProviderCooldown, QueueConfig, RunSummary, SyncQueue, SyncSnapshot};
 pub use store::{PlaylistCounts, SyncItem, SyncStatus, SyncStore, SyncTrackMeta, SyncedPlaylist};
 pub use watcher::{PlaylistSource, PlaylistTrack, PlaylistWatcher, WatcherConfig};
 pub use writer::{TrackMetadata, WriteOutcome, WriteRequest};
