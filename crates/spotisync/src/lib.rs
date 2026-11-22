@@ -20,7 +20,7 @@ pub use matching::{MatchConfig, MatchOutcome, MatchedBy, RejectReason};
 pub use providers::{Provider, qobuz::QobuzConfig, qobuz::QobuzCredentials, qobuz::QobuzProvider};
 pub use queue::{ProviderCooldown, QueueConfig, RunSummary, SyncQueue, SyncSnapshot};
 pub use store::{PlaylistCounts, SyncItem, SyncStatus, SyncStore, SyncTrackMeta, SyncedPlaylist};
-pub use watcher::{PlaylistSource, PlaylistTrack, PlaylistWatcher, WatcherConfig};
+pub use watcher::{PlaylistSource, PlaylistTrack, PlaylistWatcher, PollReport, WatcherConfig};
 pub use writer::{TrackMetadata, WriteOutcome, WriteRequest};
 
 /// Crate-wide result alias.
