@@ -15,11 +15,13 @@ use lofty::flac::FlacFile;
 use lofty::ogg::{OggPictureStorage, tag::VorbisComments};
 use lofty::picture::{MimeType, Picture, PictureInformation, PictureType};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const FLAC_MAGIC: &[u8; 4] = b"fLaC";
+/// Byte cap for one sanitized path component (directory or file name).
+const MAX_COMPONENT_BYTES: usize = 120;
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Metadata tags to embed in the written FLAC file.
@@ -85,6 +87,54 @@ pub fn build_track_path(
     root.join(artist_dir).join(album_dir).join(filename)
 }
 
+/// Returns `base` with a short, stable `[tag]` suffix before the extension.
+///
+/// Used only when a different recording already owns `base`, so two distinct
+/// recordings that map to the same metadata path never share one file.
+pub fn disambiguated_track_path(base: &Path, tag: &str) -> PathBuf {
+    let tag: String = tag
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(32)
+        .collect();
+    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
+    let ext = base.extension().and_then(|s| s.to_str()).unwrap_or("flac");
+    let name = if tag.is_empty() {
+        format!("{stem}.{ext}")
+    } else {
+        format!("{stem} [{tag}].{ext}")
+    };
+    base.with_file_name(name)
+}
+
+/// Removes leftover `.spotisync-*.tmp` files under `root` from interrupted writes.
+///
+/// Returns the number of files removed. Missing directories count as empty.
+pub fn sweep_stale_temp_files(root: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(root) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            removed += sweep_stale_temp_files(&path);
+        } else if is_spotisync_temp(&path) && fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn is_spotisync_temp(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with(".spotisync-") && n.ends_with(".tmp"))
+}
+
 /// Checks if `destination` already holds a FLAC file at `>= candidate_quality`.
 ///
 /// Returns `Ok(Some(existing_quality))` when the download can be skipped with
@@ -123,6 +173,10 @@ pub fn inspect_existing_flac_quality(path: &Path) -> Result<Option<Quality>> {
 }
 
 /// Verifies, tags, and atomically writes a FLAC file (and optional `.lrc` sidecar).
+///
+/// The quality in the outcome is the one the stream itself reports, never the
+/// quality the caller requested. The destination is inspected again right
+/// before the commit, so the never-downgrade decision uses current state.
 pub fn write_flac_atomic(request: &WriteRequest) -> Result<WriteOutcome> {
     verify_flac_magic(&request.audio_bytes)?;
 
@@ -139,9 +193,8 @@ pub fn write_flac_atomic(request: &WriteRequest) -> Result<WriteOutcome> {
 
     fs::create_dir_all(parent)?;
 
-    // Enforce the never-downgrade / never-overwrite-equal invariant before writing.
-    let existing_quality = inspect_existing_flac_quality(destination)?;
-    if let Some(existing) = existing_quality
+    // Cheap early exit: never write over a file that already meets the request.
+    if let Some(existing) = inspect_existing_flac_quality(destination)?
         && existing >= request.quality
     {
         return Ok(WriteOutcome::SkippedExisting {
@@ -162,12 +215,13 @@ pub fn write_flac_atomic(request: &WriteRequest) -> Result<WriteOutcome> {
         file.sync_all()?;
     }
 
+    verify_streaminfo_total_samples(&tmp_path)?;
     let detected_quality = tag_flac_file(&tmp_path, &request.metadata)?;
-    let effective_quality = detected_quality.max(request.quality);
 
-    // Re-check against actual decoded FLAC stream properties when upgrading.
-    if let Some(existing) = existing_quality
-        && existing >= effective_quality
+    // Authoritative never-downgrade check, made against the destination as it is now.
+    let current = inspect_existing_flac_quality(destination)?;
+    if let Some(existing) = current
+        && existing >= detected_quality
     {
         return Ok(WriteOutcome::SkippedExisting {
             path: destination.clone(),
@@ -189,21 +243,64 @@ pub fn write_flac_atomic(request: &WriteRequest) -> Result<WriteOutcome> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
+        // The FLAC is already committed, so a sidecar failure must not fail the track.
         let lrc_path = destination.with_extension("lrc");
-        write_text_atomic(&lrc_path, lyrics)?;
+        if let Err(err) = write_text_atomic(&lrc_path, lyrics) {
+            log::warn!(
+                "could not write lyrics sidecar {}: {err}",
+                lrc_path.display()
+            );
+        }
     }
 
-    match existing_quality {
+    match current {
         Some(previous_quality) => Ok(WriteOutcome::Upgraded {
             path: destination.clone(),
             previous_quality,
-            new_quality: effective_quality,
+            new_quality: detected_quality,
         }),
         None => Ok(WriteOutcome::Written {
             path: destination.clone(),
-            quality: effective_quality,
+            quality: detected_quality,
         }),
     }
+}
+
+/// Checks that `path` opens with a 34-byte STREAMINFO block for a non-empty stream.
+///
+/// Returns the total sample count. Zero samples or a zero sample rate is rejected
+/// so an empty or truncated payload never reaches the library.
+fn verify_streaminfo_total_samples(path: &Path) -> Result<u64> {
+    // Magic (4) + block header (4) + STREAMINFO (34).
+    let mut header = [0u8; 42];
+    File::open(path)?.read_exact(&mut header).map_err(|_| {
+        SyncError::InvalidAudio("temp FLAC is shorter than its STREAMINFO block".to_string())
+    })?;
+    if &header[..4] != FLAC_MAGIC {
+        return Err(SyncError::InvalidAudio(
+            "temp FLAC is missing the fLaC marker".to_string(),
+        ));
+    }
+    let block_type = header[4] & 0x7F;
+    let block_len = u32::from_be_bytes([0, header[5], header[6], header[7]]);
+    if block_type != 0 || block_len != 34 {
+        return Err(SyncError::InvalidAudio(
+            "first FLAC metadata block is not a 34-byte STREAMINFO".to_string(),
+        ));
+    }
+
+    // Packed field: 20-bit sample rate, 3-bit channels, 5-bit bit depth, 36-bit total samples.
+    let mut packed_bytes = [0u8; 8];
+    packed_bytes.copy_from_slice(&header[18..26]);
+    let packed = u64::from_be_bytes(packed_bytes);
+    let sample_rate = (packed >> 44) & 0xF_FFFF;
+    let total_samples = packed & 0xF_FFFF_FFFF;
+    if sample_rate == 0 || total_samples == 0 {
+        return Err(SyncError::InvalidAudio(
+            "FLAC STREAMINFO reports no sample rate or zero samples".to_string(),
+        ));
+    }
+    Ok(total_samples)
 }
 
 /// Verifies that raw audio bytes start with the 4-byte `fLaC` magic marker.
@@ -332,11 +429,43 @@ fn sanitize_component(raw: &str, fallback: &str) -> String {
         })
         .collect();
     let trimmed = cleaned.trim().trim_matches('.');
-    if trimmed.is_empty() {
+    let capped = truncate_to_bytes(trimmed, MAX_COMPONENT_BYTES).trim_end_matches([' ', '.']);
+    if capped.is_empty() {
         fallback.to_string()
+    } else if is_windows_reserved(capped) {
+        format!("_{capped}")
     } else {
-        trimmed.chars().take(120).collect()
+        capped.to_string()
     }
+}
+
+/// Truncates to at most `max_bytes` without splitting a UTF-8 character.
+fn truncate_to_bytes(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+/// True for names Windows refuses as files or directories, such as `CON` or `COM1.txt`.
+fn is_windows_reserved(name: &str) -> bool {
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    let bytes = stem.as_bytes();
+    bytes.len() == 4
+        && (stem.starts_with("COM") || stem.starts_with("LPT"))
+        && (b'1'..=b'9').contains(&bytes[3])
 }
 
 struct TempFileGuard {
@@ -520,5 +649,124 @@ mod tests {
         assert!(matches!(err, SyncError::InvalidAudio(_)));
         assert!(!dest.exists());
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn records_detected_stream_quality_not_requested_quality() {
+        let dir = tempdir().expect("tempdir");
+        let dest = dir.path().join("Daft Punk").join("05 - Instant Crush.flac");
+        // Provider promised 24/96 but the stream is 16/44.1.
+        let req = WriteRequest {
+            destination: dest.clone(),
+            audio_bytes: make_test_flac_bytes(16, 44_100),
+            quality: Quality::Flac24_96,
+            metadata: sample_metadata(),
+        };
+        let outcome = write_flac_atomic(&req).expect("write");
+        assert_eq!(
+            outcome,
+            WriteOutcome::Written {
+                path: dest.clone(),
+                quality: Quality::Flac16_44,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_flac_with_zero_total_samples_before_commit() {
+        let dir = tempdir().expect("tempdir");
+        let dest = dir.path().join("empty.flac");
+        let mut bytes = make_test_flac_bytes(16, 44_100).to_vec();
+        // Clear the 36-bit total sample count, keeping sample rate and bit depth.
+        let mut packed_bytes = [0u8; 8];
+        packed_bytes.copy_from_slice(&bytes[18..26]);
+        let packed = u64::from_be_bytes(packed_bytes) & !0xF_FFFF_FFFFu64;
+        bytes[18..26].copy_from_slice(&packed.to_be_bytes());
+
+        let req = WriteRequest {
+            destination: dest.clone(),
+            audio_bytes: Bytes::from(bytes),
+            quality: Quality::Flac16_44,
+            metadata: sample_metadata(),
+        };
+        let err = write_flac_atomic(&req).expect_err("zero samples must be rejected");
+        assert!(matches!(err, SyncError::InvalidAudio(_)));
+        assert!(!dest.exists());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn lyrics_sidecar_failure_keeps_committed_flac_successful() {
+        let dir = tempdir().expect("tempdir");
+        let dest = dir.path().join("05 - Instant Crush.flac");
+        // A directory at the sidecar path makes the .lrc rename fail.
+        fs::create_dir(dest.with_extension("lrc")).expect("blocking dir");
+        let req = WriteRequest {
+            destination: dest.clone(),
+            audio_bytes: make_test_flac_bytes(16, 44_100),
+            quality: Quality::Flac16_44,
+            metadata: sample_metadata(),
+        };
+        let outcome = write_flac_atomic(&req).expect("FLAC commit must still succeed");
+        assert!(matches!(outcome, WriteOutcome::Written { .. }));
+        assert!(dest.exists());
+        assert_eq!(
+            sweep_stale_temp_files(dir.path()),
+            0,
+            "no temp file may remain after a sidecar failure"
+        );
+    }
+
+    #[test]
+    fn windows_reserved_names_and_byte_cap_are_applied() {
+        let root = Path::new("/music");
+        let path = build_track_path(root, "CON", "nul.txt", None, "COM1");
+        let parts: Vec<String> = path
+            .strip_prefix(root)
+            .unwrap()
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(parts, vec!["_CON", "_nul.txt", "_COM1.flac"]);
+
+        let long_album = "é".repeat(100); // 200 bytes, 100 chars
+        let path = build_track_path(root, "Artist", &long_album, Some(1), "Title");
+        let album_dir = path
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        assert!(album_dir.len() <= MAX_COMPONENT_BYTES);
+        assert!(album_dir.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn disambiguated_path_keeps_extension_and_drops_unsafe_characters() {
+        let base = Path::new("/music/Artist/Album/05 - Title.flac");
+        assert_eq!(
+            disambiguated_track_path(base, "4uLU6hMCjMI75M1KT2mnW2"),
+            PathBuf::from("/music/Artist/Album/05 - Title [4uLU6hMCjMI75M1KT2mnW2].flac")
+        );
+        assert_eq!(
+            disambiguated_track_path(base, "../x"),
+            PathBuf::from("/music/Artist/Album/05 - Title [x].flac")
+        );
+    }
+
+    #[test]
+    fn sweep_removes_only_stale_spotisync_temp_files() {
+        let dir = tempdir().expect("tempdir");
+        let nested = dir.path().join("Artist").join("Album");
+        fs::create_dir_all(&nested).unwrap();
+        let stale = nested.join(".spotisync-track-flac-1-2.tmp");
+        fs::write(&stale, b"partial").unwrap();
+        let keep = nested.join("05 - Title.flac");
+        fs::write(&keep, b"real").unwrap();
+
+        assert_eq!(sweep_stale_temp_files(dir.path()), 1);
+        assert!(!stale.exists());
+        assert!(keep.exists());
+        assert_eq!(sweep_stale_temp_files(&dir.path().join("missing")), 0);
     }
 }

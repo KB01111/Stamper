@@ -4,19 +4,42 @@ use lofty::config::ParseOptions;
 use lofty::file::AudioFile;
 use lofty::flac::FlacFile;
 use spotisync::providers::qobuz::{QobuzConfig, QobuzCredentials, QobuzProvider};
-use spotisync::writer::make_test_flac_bytes;
+use spotisync::writer::{build_track_path, make_test_flac_bytes};
 use spotisync::{
     Candidate, Provider, Quality, Query, QueueConfig, Result, SyncError, SyncQueue, SyncStatus,
     SyncStore,
 };
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+
+/// Queue settings with no real pacing, so tests run quickly.
+fn fast_config(output_dir: PathBuf) -> QueueConfig {
+    QueueConfig {
+        output_dir,
+        per_provider_rps: 100.0,
+        per_provider_burst: 10.0,
+        ..QueueConfig::default()
+    }
+}
+
+/// Reads one HTTP request head up to the blank line, across however many packets it spans.
+async fn read_request_head(socket: &mut TcpStream) -> String {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.len() < 16 * 1024 {
+        match socket.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
 
 fn sample_query(title: &str, isrc: &str, track_num: u32) -> Query {
     Query {
@@ -37,10 +60,13 @@ struct ScriptedProvider {
     bit_depth: u8,
     sample_rate_hz: u32,
     fetch_calls: AtomicUsize,
+    search_calls: AtomicUsize,
     fail_5xx_times: AtomicUsize,
     rate_limit_times: AtomicUsize,
     retry_after_secs: u64,
     lyrics: Option<String>,
+    search_delay: Duration,
+    fetch_delay: Duration,
 }
 
 impl ScriptedProvider {
@@ -49,15 +75,22 @@ impl ScriptedProvider {
             bit_depth,
             sample_rate_hz,
             fetch_calls: AtomicUsize::new(0),
+            search_calls: AtomicUsize::new(0),
             fail_5xx_times: AtomicUsize::new(0),
             rate_limit_times: AtomicUsize::new(0),
             retry_after_secs: 1,
             lyrics: Some("[00:05.00] Test lyric line\n".to_string()),
+            search_delay: Duration::ZERO,
+            fetch_delay: Duration::ZERO,
         }
     }
 
     fn fetch_count(&self) -> usize {
         self.fetch_calls.load(Ordering::SeqCst)
+    }
+
+    fn search_count(&self) -> usize {
+        self.search_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -72,6 +105,10 @@ impl Provider for ScriptedProvider {
     }
 
     async fn search(&self, q: &Query) -> Result<Vec<Candidate>> {
+        self.search_calls.fetch_add(1, Ordering::SeqCst);
+        if !self.search_delay.is_zero() {
+            tokio::time::sleep(self.search_delay).await;
+        }
         if self.rate_limit_times.load(Ordering::SeqCst) > 0 {
             let prev = self.rate_limit_times.fetch_sub(1, Ordering::SeqCst);
             if prev > 0 {
@@ -116,6 +153,9 @@ impl Provider for ScriptedProvider {
 
     async fn fetch(&self, _c: &Candidate, _q: Quality) -> Result<Bytes> {
         self.fetch_calls.fetch_add(1, Ordering::SeqCst);
+        if !self.fetch_delay.is_zero() {
+            tokio::time::sleep(self.fetch_delay).await;
+        }
         Ok(make_test_flac_bytes(self.bit_depth, self.sample_rate_hz))
     }
 }
@@ -418,15 +458,18 @@ async fn qobuz_provider_fetch_end_to_end_over_local_http_with_429_and_flac_valid
     let flac_for_server = flac_payload.clone();
     let stream_url = format!("{base_url}/stream/track10760101.flac");
 
+    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
         let mut get_file_url_hits = 0usize;
-        for _ in 0..4 {
-            let Ok((mut socket, _)) = listener.accept().await else {
-                break;
+        loop {
+            let (mut socket, _) = tokio::select! {
+                _ = &mut stop_rx => break,
+                accepted = listener.accept() => match accepted {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                },
             };
-            let mut buf = vec![0u8; 8192];
-            let n = socket.read(&mut buf).await.unwrap_or(0);
-            let req = String::from_utf8_lossy(&buf[..n]);
+            let req = read_request_head(&mut socket).await;
 
             if req.starts_with("GET /track/search") {
                 let body = include_str!("fixtures/qobuz_search_response.json");
@@ -513,6 +556,7 @@ async fn qobuz_provider_fetch_end_to_end_over_local_http_with_429_and_flac_valid
     let summary = queue.process_pending().await.unwrap();
     drop(queue);
     let _ = watcher.await;
+    let _ = stop_tx.send(());
     let _ = server.await;
 
     assert_eq!(summary.done, 1);
@@ -529,4 +573,285 @@ async fn qobuz_provider_fetch_end_to_end_over_local_http_with_429_and_flac_valid
     let flac = FlacFile::read_from(&mut written_file, ParseOptions::new()).unwrap();
     assert_eq!(flac.properties().bit_depth(), 24);
     assert_eq!(flac.properties().sample_rate(), 96_000);
+}
+
+#[tokio::test]
+async fn non_flac_file_at_destination_fails_fast_without_downloading() {
+    let dir = tempdir().expect("tempdir");
+    let out_dir = dir.path().join("music");
+    let store = SyncStore::open_in_memory().expect("store");
+    store
+        .enqueue_track(
+            "pl1",
+            "t5",
+            &sample_query("Instant Crush", "USQX91300105", 5),
+        )
+        .unwrap();
+    let destination = build_track_path(
+        &out_dir,
+        "Daft Punk",
+        "Random Access Memories",
+        Some(5),
+        "Instant Crush",
+    );
+    fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    fs::write(&destination, b"ID3\x03\x00 not a flac").unwrap();
+
+    let provider = Arc::new(ScriptedProvider::new(16, 44_100));
+    let queue =
+        SyncQueue::new(store.clone(), vec![provider.clone()], fast_config(out_dir)).unwrap();
+
+    let summary = queue.process_pending().await.expect("pass");
+    assert_eq!(summary.failed, 1);
+    assert_eq!(
+        provider.fetch_count(),
+        0,
+        "an unreadable destination must not trigger a full download"
+    );
+    let row = store.get_item("pl1", "t5").unwrap().unwrap();
+    assert_eq!(row.status, SyncStatus::Failed);
+    assert!(
+        row.error
+            .unwrap_or_default()
+            .contains("not a readable FLAC")
+    );
+}
+
+#[tokio::test]
+async fn same_file_from_two_playlists_is_downloaded_once() {
+    let dir = tempdir().expect("tempdir");
+    let out_dir = dir.path().join("music");
+    let store = SyncStore::open_in_memory().expect("store");
+    let query = sample_query("Instant Crush", "USQX91300105", 5);
+    store.enqueue_track("pl1", "t5", &query).unwrap();
+    store.enqueue_track("pl2", "t5", &query).unwrap();
+
+    // The delayed fetch keeps the first write in progress while the second item checks the file.
+    let mut slow = ScriptedProvider::new(16, 44_100);
+    slow.fetch_delay = Duration::from_millis(300);
+    let provider = Arc::new(slow);
+    let queue = SyncQueue::new(
+        store.clone(),
+        vec![provider.clone()],
+        fast_config(out_dir.clone()),
+    )
+    .unwrap();
+
+    let summary = queue.process_pending().await.expect("pass");
+    assert_eq!(summary.done, 2);
+    assert_eq!(
+        provider.fetch_count(),
+        1,
+        "the second playlist must reuse the file written under the destination lock"
+    );
+    assert_eq!(count_tmp_files_recursive(&out_dir), 0);
+}
+
+#[tokio::test]
+async fn rate_limit_exhaustion_defers_items_and_skips_the_provider_for_the_pass() {
+    let dir = tempdir().expect("tempdir");
+    let out_dir = dir.path().join("music");
+    let store = SyncStore::open_in_memory().expect("store");
+    store
+        .enqueue_track(
+            "pl1",
+            "t1",
+            &sample_query("Give Life Back to Music", "USQX91300101", 1),
+        )
+        .unwrap();
+    store
+        .enqueue_track(
+            "pl1",
+            "t2",
+            &sample_query("The Game of Love", "USQX91300102", 2),
+        )
+        .unwrap();
+
+    // The first search gets a 429 and the provider is then healthy again.
+    let provider = Arc::new(ScriptedProvider::new(16, 44_100));
+    provider.rate_limit_times.store(1, Ordering::SeqCst);
+    let queue = SyncQueue::new(
+        store.clone(),
+        vec![provider.clone()],
+        QueueConfig {
+            per_provider_concurrency: 1,
+            max_attempts: 1,
+            ..fast_config(out_dir)
+        },
+    )
+    .unwrap();
+
+    let first = queue.process_pending().await.expect("first pass");
+    assert_eq!(first.deferred, 2);
+    assert_eq!(first.failed, 0);
+    assert_eq!(
+        provider.search_count(),
+        1,
+        "an exhausted provider must not be called again in the same pass"
+    );
+    for track in ["t1", "t2"] {
+        let row = store.get_item("pl1", track).unwrap().unwrap();
+        assert_eq!(row.status, SyncStatus::Pending);
+        assert_eq!(row.attempts, 0, "rate limiting must not burn an attempt");
+    }
+
+    // After Retry-After the next pass completes both tracks.
+    let second = queue.process_pending().await.expect("second pass");
+    assert_eq!(second.done, 2);
+    assert_eq!(provider.search_count(), 3);
+}
+
+#[tokio::test]
+async fn failed_completion_write_is_reported_and_recovered_on_the_next_pass() {
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path().join("sync.db");
+    let out_dir = dir.path().join("music");
+    let store = SyncStore::open(&db_path).expect("store");
+    store
+        .enqueue_track(
+            "pl1",
+            "t5",
+            &sample_query("Instant Crush", "USQX91300105", 5),
+        )
+        .unwrap();
+
+    // Reject every write that marks a row done, through a second connection.
+    let saboteur = rusqlite::Connection::open(&db_path).expect("second connection");
+    saboteur
+        .execute_batch(
+            "CREATE TRIGGER block_done BEFORE UPDATE OF status ON sync_items
+             WHEN NEW.status = 'done'
+             BEGIN SELECT RAISE(ABORT, 'forced failure'); END;",
+        )
+        .unwrap();
+
+    let provider = Arc::new(ScriptedProvider::new(16, 44_100));
+    let queue =
+        SyncQueue::new(store.clone(), vec![provider.clone()], fast_config(out_dir)).unwrap();
+
+    let first = queue.process_pending().await.expect("first pass");
+    assert_eq!(
+        first.done, 0,
+        "an unrecorded completion must not count as done"
+    );
+    assert_eq!(first.store_errors.len(), 1);
+    assert!(first.store_errors[0].starts_with("mark_done:"));
+    assert_eq!(
+        store.get_item("pl1", "t5").unwrap().unwrap().status,
+        SyncStatus::Downloading
+    );
+
+    saboteur.execute_batch("DROP TRIGGER block_done;").unwrap();
+    let second = queue.process_pending().await.expect("second pass");
+    assert_eq!(second.recovered, 1);
+    assert_eq!(second.done, 1);
+    assert!(second.store_errors.is_empty());
+    assert_eq!(
+        provider.fetch_count(),
+        1,
+        "the written file is reused, not downloaded again"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_interrupts_a_slow_pass_and_leaves_its_row_resumable() {
+    let dir = tempdir().expect("tempdir");
+    let store = SyncStore::open_in_memory().expect("store");
+    store
+        .enqueue_track("pl1", "t7", &sample_query("Touch", "USQX91300107", 7))
+        .unwrap();
+
+    let mut slow = ScriptedProvider::new(16, 44_100);
+    slow.search_delay = Duration::from_secs(30);
+    let queue = SyncQueue::new(
+        store.clone(),
+        vec![Arc::new(slow)],
+        fast_config(dir.path().join("music")),
+    )
+    .unwrap();
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let runner = tokio::spawn({
+        let queue = queue.clone();
+        async move { queue.run_until_shutdown(shutdown_rx).await }
+    });
+
+    // Give the pass time to reach the slow search.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        store.get_item("pl1", "t7").unwrap().unwrap().status,
+        SyncStatus::Resolving
+    );
+    shutdown_tx.send(true).expect("runner is listening");
+
+    let result = tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("shutdown must not wait for the 30 second search")
+        .expect("runner task joins");
+    assert!(result.is_ok());
+    assert_eq!(
+        store.recover_interrupted().unwrap(),
+        1,
+        "the interrupted row must be left for recovery"
+    );
+}
+
+#[tokio::test]
+async fn distinct_recordings_with_the_same_metadata_path_get_distinct_files() {
+    let dir = tempdir().expect("tempdir");
+    let out_dir = dir.path().join("music");
+    let store = SyncStore::open_in_memory().expect("store");
+    store
+        .enqueue_track(
+            "pl1",
+            "t1",
+            &sample_query("Instant Crush", "USQX91300105", 5),
+        )
+        .unwrap();
+    // Same title, album and track number, but a different ISRC: a different recording.
+    store
+        .enqueue_track(
+            "pl1",
+            "t2",
+            &sample_query("Instant Crush", "USQX91300199", 5),
+        )
+        .unwrap();
+
+    let provider = Arc::new(ScriptedProvider::new(16, 44_100));
+    let queue =
+        SyncQueue::new(store.clone(), vec![provider], fast_config(out_dir.clone())).unwrap();
+
+    let summary = queue.process_pending().await.expect("pass");
+    assert_eq!(summary.done, 2);
+
+    let path_of = |track: &str| {
+        PathBuf::from(
+            store
+                .get_item("pl1", track)
+                .unwrap()
+                .unwrap()
+                .path
+                .expect("done rows record a path"),
+        )
+    };
+    let (p1, p2) = (path_of("t1"), path_of("t2"));
+    assert_ne!(p1, p2, "distinct recordings must not share a file");
+    assert!(p1.exists() && p2.exists());
+
+    let plain = build_track_path(
+        &out_dir,
+        "Daft Punk",
+        "Random Access Memories",
+        Some(5),
+        "Instant Crush",
+    );
+    assert!(
+        p1 == plain || p2 == plain,
+        "one recording keeps the plain metadata path"
+    );
+    assert!(
+        p1.to_string_lossy().contains(" [t") || p2.to_string_lossy().contains(" [t"),
+        "the other recording gets a disambiguating suffix"
+    );
+    assert_eq!(count_tmp_files_recursive(&out_dir), 0);
 }
