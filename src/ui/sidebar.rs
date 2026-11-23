@@ -1006,6 +1006,17 @@ fn nav_row(
     label: &str,
     active: bool,
 ) -> egui::Response {
+    nav_row_with_badge(ui, palette, icon, label, active, None)
+}
+
+fn nav_row_with_badge(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    icon: Icon,
+    label: &str,
+    active: bool,
+    badge: Option<&str>,
+) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::click());
     if ui.is_rect_visible(rect) {
         let color = if active || response.hovered() {
@@ -1016,13 +1027,43 @@ fn nav_row(
         let icon_rect =
             Rect::from_center_size(pos2(rect.left() + 22.0, rect.center().y), Vec2::splat(22.0));
         icon.image(color, 22.0).paint_at(ui, icon_rect);
-        ui.painter().text(
+        // The badge is laid out first so the label can stop short of it.
+        let badge_pill = badge.map(|badge| {
+            let galley = ui.painter().layout_no_wrap(
+                badge.to_string(),
+                theme::semibold(11.0),
+                palette.on_accent,
+            );
+            let pill_size = vec2((galley.size().x + 12.0).max(20.0), 18.0);
+            let pill_rect = Rect::from_center_size(
+                pos2(rect.right() - pill_size.x / 2.0 - 8.0, rect.center().y),
+                pill_size,
+            );
+            (galley, pill_rect)
+        });
+        let label_painter = match &badge_pill {
+            Some((_, pill_rect)) => ui.painter().with_clip_rect(Rect::from_min_max(
+                rect.min,
+                pos2(pill_rect.left() - 6.0, rect.max.y),
+            )),
+            None => ui.painter().clone(),
+        };
+        label_painter.text(
             pos2(rect.left() + 46.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
             label,
             theme::bold(15.0),
             color,
         );
+        if let Some((galley, pill_rect)) = badge_pill {
+            ui.painter()
+                .rect_filled(pill_rect, pill_rect.height() / 2.0, palette.accent);
+            ui.painter().galley(
+                pill_rect.center() - galley.size() / 2.0,
+                galley,
+                palette.on_accent,
+            );
+        }
     }
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), active, label)
@@ -1059,6 +1100,33 @@ fn contents(app: &mut App, ui: &mut egui::Ui, grid_art: Option<Rect>) {
     .clicked()
     {
         app.actions.push(Action::FocusSearch);
+    }
+    if nav_row(
+        ui,
+        &palette,
+        Icon::Disc,
+        &gettext(locale, "Synced Library"),
+        page == Page::SyncedLibrary,
+    )
+    .clicked()
+    {
+        app.actions.push(Action::Open(Page::SyncedLibrary));
+    }
+    let sync_active_badge = app.sync_state.active_running.then(|| {
+        let snap = &app.sync_state.snapshot;
+        (snap.pending + snap.resolving + snap.downloading).to_string()
+    });
+    if nav_row_with_badge(
+        ui,
+        &palette,
+        Icon::Refresh,
+        &gettext(locale, "Sync Queue"),
+        page == Page::SyncQueue,
+        sync_active_badge.as_deref(),
+    )
+    .clicked()
+    {
+        app.actions.push(Action::Open(Page::SyncQueue));
     }
     ui.add_space(10.0);
     ui.painter().hline(

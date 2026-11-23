@@ -1408,6 +1408,7 @@ fn item_menu_at(
             }
         }
     }
+    super::sync::track_menu_items(ui, app, item, context);
     menu_separator(ui, &palette);
     if menu_item(
         ui,
@@ -1543,6 +1544,7 @@ pub fn context_menu_items(
                 }));
         }
     }
+    super::sync::playlist_menu_item(ui, app, uri, name);
     menu_separator(ui, &palette);
     let radio = match kind {
         "playlist" => Some(gettext(locale, "Go to playlist radio")),
@@ -1979,6 +1981,12 @@ fn track_row_contents(
         );
         child.set_clip_rect(title_rect.intersect(ui.clip_rect()));
         child.spacing_mut().item_spacing = vec2(6.0, 0.0);
+        if let Some(info) = super::sync::context_playlist_id(row.context).and_then(|pid| {
+            super::sync::item_track_id(row.item)
+                .and_then(|tid| app.sync_state.track_status(pid, tid))
+        }) {
+            super::sync::track_status_dot(&mut child, &palette, info);
+        }
         theme::text(
             &mut child,
             row.item.name(),
@@ -2075,6 +2083,12 @@ fn track_row_contents(
         child.add_space(vertical_pad);
         child.horizontal(|ui| {
             ui.set_max_width(title_rect.width());
+            if let Some(info) = super::sync::context_playlist_id(row.context).and_then(|pid| {
+                super::sync::item_track_id(row.item)
+                    .and_then(|tid| app.sync_state.track_status(pid, tid))
+            }) {
+                super::sync::track_status_dot(ui, &palette, info);
+            }
             theme::text(ui, row.item.name(), theme::medium(14.5), title_color);
         });
         child.horizontal(|ui| {

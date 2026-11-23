@@ -776,6 +776,195 @@ pub fn populate(app: &mut App) {
             app.track_cache.insert(id.clone(), track.clone());
         }
     }
+
+    // Lossless playlist sync demo state: playlist "pl1" ("Late night focus")
+    // covers every track status, an active provider cooldown, and 5 downloaded
+    // lossless FLAC files in Synced Library.
+    seed_demo_sync_state(app, &tracks, demo_now);
+}
+
+fn seed_demo_sync_state(app: &mut App, tracks: &[Track], demo_now: Timestamp) {
+    use crate::settings::SyncedPlaylistSetting;
+    use crate::sync_bridge::{CredentialStatus, SyncUiState, SyncedLibraryTrack, TrackSyncInfo};
+    use spotisync::{PlaylistCounts, ProviderCooldown, SyncSnapshot, SyncStatus, SyncedPlaylist};
+    use std::collections::{BTreeMap, HashMap};
+    use std::path::PathBuf;
+
+    let playlist_id = "pl1".to_string();
+    let playlist_name = "Late night focus".to_string();
+    let now_secs = demo_now.as_second().max(0) as u64;
+
+    let mut track_statuses = HashMap::new();
+    let mut library_tracks = Vec::new();
+    let done_qualities = [
+        ("24-bit / 96 kHz FLAC", "isrc"),
+        ("24-bit / 192 kHz FLAC", "isrc"),
+        ("16-bit / 44.1 kHz FLAC", "exact"),
+        ("24-bit / 96 kHz FLAC", "isrc"),
+        ("16-bit / 44.1 kHz FLAC", "exact"),
+    ];
+
+    for (index, (quality, matched_by)) in done_qualities.iter().enumerate() {
+        if let Some(track) = tracks.get(index)
+            && let Some(track_id) = track.id.clone()
+        {
+            let artist_name = track.artist_names();
+            let album_name = track
+                .album
+                .as_ref()
+                .map(|a| a.name.clone())
+                .unwrap_or_default();
+            let path = PathBuf::from(format!(
+                "demo-library/{artist_name}/{album_name}/{:02} - {}.flac",
+                index + 1,
+                track.name
+            ));
+            track_statuses.insert(
+                (playlist_id.clone(), track_id.clone()),
+                TrackSyncInfo {
+                    status: SyncStatus::Done,
+                    matched_by: Some((*matched_by).into()),
+                    provider: Some("qobuz".into()),
+                    quality: Some((*quality).into()),
+                    path: Some(path.clone()),
+                    error: None,
+                },
+            );
+            library_tracks.push(SyncedLibraryTrack {
+                playlist_id: playlist_id.clone(),
+                track_id,
+                title: track.name.clone(),
+                artists: artist_name,
+                album: album_name,
+                duration_ms: u64::from(track.duration_ms),
+                quality: Some((*quality).into()),
+                provider: Some("qobuz".into()),
+                path,
+            });
+        }
+    }
+
+    if let Some(track_id) = tracks.get(5).and_then(|t| t.id.clone()) {
+        track_statuses.insert(
+            (playlist_id.clone(), track_id),
+            TrackSyncInfo {
+                status: SyncStatus::Downloading,
+                matched_by: Some("isrc".into()),
+                provider: Some("qobuz".into()),
+                quality: Some("24-bit / 96 kHz FLAC".into()),
+                path: None,
+                error: None,
+            },
+        );
+    }
+    if let Some(track_id) = tracks.get(6).and_then(|t| t.id.clone()) {
+        track_statuses.insert(
+            (playlist_id.clone(), track_id),
+            TrackSyncInfo {
+                status: SyncStatus::Resolving,
+                matched_by: None,
+                provider: Some("qobuz".into()),
+                quality: None,
+                path: None,
+                error: None,
+            },
+        );
+    }
+    for index in [7usize, 8] {
+        if let Some(track_id) = tracks.get(index).and_then(|t| t.id.clone()) {
+            track_statuses.insert(
+                (playlist_id.clone(), track_id),
+                TrackSyncInfo {
+                    status: SyncStatus::Pending,
+                    ..TrackSyncInfo::default()
+                },
+            );
+        }
+    }
+    if let Some(track_id) = tracks.get(9).and_then(|t| t.id.clone()) {
+        track_statuses.insert(
+            (playlist_id.clone(), track_id),
+            TrackSyncInfo {
+                status: SyncStatus::Unmatched,
+                matched_by: None,
+                provider: Some("qobuz".into()),
+                quality: None,
+                path: None,
+                error: Some("No lossless match within duration tolerance".into()),
+            },
+        );
+    }
+    if let Some(track_id) = tracks.get(10).and_then(|t| t.id.clone()) {
+        track_statuses.insert(
+            (playlist_id.clone(), track_id),
+            TrackSyncInfo {
+                status: SyncStatus::Failed,
+                matched_by: Some("isrc".into()),
+                provider: Some("qobuz".into()),
+                quality: None,
+                path: None,
+                error: Some("HTTP 503 Service Unavailable after 5 attempts".into()),
+            },
+        );
+    }
+
+    let mut cooldowns = BTreeMap::new();
+    cooldowns.insert(
+        "qobuz".into(),
+        ProviderCooldown {
+            provider: "qobuz".into(),
+            retry_at_unix_secs: now_secs + 12,
+            remaining_secs: 12,
+            message: "rate limited, retrying in 12s".into(),
+        },
+    );
+
+    let counts = PlaylistCounts {
+        playlist_id: playlist_id.clone(),
+        pending: 2,
+        resolving: 1,
+        downloading: 1,
+        done: 5,
+        unmatched: 1,
+        failed: 1,
+    };
+    let mut playlist_counts = HashMap::new();
+    playlist_counts.insert(playlist_id.clone(), counts);
+
+    app.sync_state = SyncUiState {
+        snapshot: SyncSnapshot {
+            pending: 2,
+            resolving: 1,
+            downloading: 1,
+            done: 5,
+            unmatched: 1,
+            failed: 1,
+            active_tracks: vec!["trk5".into(), "trk6".into()],
+            cooldowns,
+        },
+        playlists: vec![SyncedPlaylist {
+            playlist_id: playlist_id.clone(),
+            name: playlist_name.clone(),
+            enabled: true,
+            last_polled_at: Some(demo_now.as_second() - 25),
+        }],
+        playlist_counts,
+        track_statuses,
+        library_tracks,
+        qobuz_credentials: CredentialStatus::Valid {
+            provider: "qobuz".into(),
+            detail: "Demo account".into(),
+        },
+        qobuz_app_id_hint: Some("950096963".into()),
+        active_running: true,
+        last_error: None,
+    };
+
+    app.settings.sync.synced_playlists = vec![SyncedPlaylistSetting {
+        id: playlist_id,
+        name: playlist_name,
+        enabled: true,
+    }];
 }
 
 #[cfg(feature = "demo")]
@@ -1215,6 +1404,30 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
                         release_unix: Timestamp::now().as_second() + 14 * 86400,
                     },
                 );
+            }
+            "sync-local-flac" => {
+                if let Some(first) = app.sync_state.library_tracks.first().cloned() {
+                    app.local_flac.active = true;
+                    app.local_flac.playback = crate::player::Playback::Playing;
+                    app.local_flac.position_ms = 64_000;
+                    app.local_flac.duration_ms = first.duration_ms;
+                    app.local_flac.track = Some(crate::local_player::LocalFlacTrack {
+                        path: first.path,
+                        title: first.title,
+                        artists: vec![first.artists],
+                        album: first.album,
+                        duration_ms: first.duration_ms,
+                        playlist_id: Some(first.playlist_id),
+                        track_id: Some(first.track_id),
+                        quality_label: first.quality,
+                        sample_rate_hz: Some(96_000),
+                        bit_depth: Some(24),
+                    });
+                }
+            }
+            "sync-queue-panel" => {
+                app.show_queue_panel = true;
+                app.queue_tab = QueueTab::Sync;
             }
             "spotify-access-missing" | "spotify-access-authorizing" => {
                 app.local_ready = false;
@@ -3712,6 +3925,7 @@ mod tests {
         use egui::accesskit::Role;
         let (ctx, mut app) = accessible_app("library-grid-drop-highlight");
         app.settings.sidebar_grid = true;
+        let _ = accessible_frame(&ctx, &mut app, vec![]);
         let tree = accessible_frame(&ctx, &mut app, vec![]);
         let liked = tree
             .nodes
@@ -3720,6 +3934,7 @@ mod tests {
                 (node.role() == Role::Button && node.label() == Some("Liked Songs"))
                     .then(|| node.bounds())
                     .flatten()
+                    .filter(|bounds| bounds.x0 < f64::from(app.settings.sidebar_width))
             })
             .expect("Liked Songs card");
         let pos = egui::pos2(liked.x0 as f32 + 24.0, liked.y0 as f32 + 24.0);
@@ -11920,7 +12135,7 @@ mod tests {
         // right under Liked Songs, between what were the first two
         // unpinned playlists.
         let mut dropped = false;
-        for step in 0..40 {
+        for step in 0..55 {
             let pos = egui::pos2(120.0, 100.0 + step as f32 * 10.0);
             egui::DragAndDrop::set_payload(
                 &ctx,
@@ -13898,6 +14113,301 @@ mod tests {
             }),
             "the selected category replaces the placeholders"
         );
+        app.backend.shutdown();
+    }
+
+    fn collect_drawn_text(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::epaint::Shape::Text(text) => out.push(text.galley.job.text.clone()),
+            egui::epaint::Shape::Vec(shapes) => {
+                for child in shapes {
+                    collect_drawn_text(child, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn run_demo_frame(
+        ctx: &egui::Context,
+        app: &mut App,
+        size: egui::Vec2,
+    ) -> (Vec<String>, egui::accesskit::TreeUpdate) {
+        let mut last = None;
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    ..Default::default()
+                },
+                |ui| app.frame_ui(ui),
+            );
+            output.textures_delta.clear();
+            last = Some(output);
+        }
+        let output = last.unwrap();
+        let mut drawn = Vec::new();
+        for clipped in &output.shapes {
+            collect_drawn_text(&clipped.shape, &mut drawn);
+        }
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .expect("accesskit update");
+        (drawn, tree)
+    }
+
+    #[test]
+    fn sync_settings_section_renders_in_light_and_dark_themes_and_narrow_and_normal_sizes() {
+        for theme in [
+            crate::settings::ThemeChoice::Dark,
+            crate::settings::ThemeChoice::Light,
+        ] {
+            for size in [egui::vec2(760.0, 1800.0), egui::vec2(1280.0, 1800.0)] {
+                let (ctx, mut app) = accessible_app("sync-settings");
+                app.settings.theme = theme;
+                app.palette = match theme {
+                    crate::settings::ThemeChoice::Light => crate::theme::Palette::light(),
+                    _ => crate::theme::Palette::dark(),
+                };
+                crate::theme::apply(&ctx, &app.palette);
+                app.open(Page::Settings);
+                // Filter directly to Sync so the section is always in viewport
+                // and live search integration is exercised too.
+                ctx.data_mut(|data| {
+                    data.insert_temp(egui::Id::new("settings-filter"), "sync".to_string())
+                });
+                let (drawn, tree) = run_demo_frame(&ctx, &mut app, size);
+                assert!(
+                    drawn.iter().any(|t| t == "Sync"),
+                    "{theme:?} {size:?}: Sync settings heading missing"
+                );
+                assert!(
+                    drawn.iter().any(|t| t == "Library root"),
+                    "{theme:?} {size:?}: Library root row missing"
+                );
+                assert!(
+                    drawn.iter().any(|t| t == "Qobuz credentials"),
+                    "{theme:?} {size:?}: Qobuz credentials row missing"
+                );
+                assert!(
+                    drawn.iter().any(|t| t.contains("Valid (Demo account)")),
+                    "{theme:?} {size:?}: credential status pill missing"
+                );
+                assert!(
+                    drawn.iter().any(|t| t == "Quality ceiling"),
+                    "{theme:?} {size:?}: Quality ceiling row missing"
+                );
+                assert!(
+                    drawn.iter().any(|t| t == "Concurrency"),
+                    "{theme:?} {size:?}: Concurrency row missing"
+                );
+                assert!(
+                    drawn.iter().any(|t| t == "Late night focus"),
+                    "{theme:?} {size:?}: synced playlist entry missing"
+                );
+                assert!(
+                    tree.nodes
+                        .iter()
+                        .any(|(_, node)| node.label() == Some("Save & validate")),
+                    "{theme:?} {size:?}: Save & validate button missing from accessibility tree"
+                );
+                app.backend.shutdown();
+            }
+        }
+    }
+
+    #[test]
+    fn synced_playlist_renders_header_pill_and_track_status_dots() {
+        for compact_list in [false, true] {
+            let (ctx, mut app) = accessible_app("synced-playlist");
+            app.settings.tracklist_compact = compact_list;
+            app.open(Page::Playlist("pl1".into()));
+            let (drawn, tree) = run_demo_frame(&ctx, &mut app, egui::vec2(1280.0, 1400.0));
+            assert!(
+                drawn.iter().any(|t| t == "Synced (5/11)"),
+                "compact={compact_list}: synced header pill missing; drawn={drawn:?}"
+            );
+            let sync_dot_labels: Vec<_> = tree
+                .nodes
+                .iter()
+                .filter_map(|(_, node)| node.label().or_else(|| node.value()))
+                .filter(|label| label.starts_with("Sync status: "))
+                .collect();
+            assert!(
+                sync_dot_labels.contains(&"Sync status: Synced"),
+                "compact={compact_list}: Done dot missing; labels={sync_dot_labels:?}"
+            );
+            assert!(
+                sync_dot_labels.contains(&"Sync status: Downloading"),
+                "compact={compact_list}: Downloading dot missing; labels={sync_dot_labels:?}"
+            );
+            assert!(
+                sync_dot_labels.contains(&"Sync status: Pending"),
+                "compact={compact_list}: Pending dot missing; labels={sync_dot_labels:?}"
+            );
+            assert!(
+                sync_dot_labels.contains(&"Sync status: Unmatched"),
+                "compact={compact_list}: Unmatched dot missing; labels={sync_dot_labels:?}"
+            );
+            assert!(
+                sync_dot_labels.contains(&"Sync status: Failed"),
+                "compact={compact_list}: Failed dot missing; labels={sync_dot_labels:?}"
+            );
+            app.backend.shutdown();
+        }
+    }
+
+    #[test]
+    fn sync_queue_renders_progress_and_cooldown_banner() {
+        let (ctx, mut app) = accessible_app("sync-queue");
+        app.open(Page::SyncQueue);
+        app.show_queue_panel = true;
+        app.queue_tab = QueueTab::Sync;
+        let (drawn, _tree) = run_demo_frame(&ctx, &mut app, egui::vec2(1280.0, 900.0));
+        assert!(
+            drawn.iter().any(|t| t == "Sync Queue"),
+            "Sync Queue page heading missing"
+        );
+        assert!(
+            drawn
+                .iter()
+                .any(|t| t == "qobuz: rate limited, retrying in 12s"),
+            "cooldown banner missing; drawn={drawn:?}"
+        );
+        assert!(
+            drawn.iter().any(|t| t == "5 of 11 synced"),
+            "progress summary missing"
+        );
+        assert!(
+            drawn.iter().any(|t| t == "Retry"),
+            "Retry action button missing for failed/unmatched items"
+        );
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn synced_library_renders_lossless_rows_and_local_flac_badge() {
+        let (ctx, mut app) = accessible_app("synced-library");
+        app.open(Page::SyncedLibrary);
+        if let Some(first) = app.sync_state.library_tracks.first().cloned() {
+            app.local_flac.active = true;
+            app.local_flac.playback = crate::player::Playback::Playing;
+            app.local_flac.duration_ms = first.duration_ms;
+            app.local_flac.position_ms = 42_000;
+            app.local_flac.track = Some(crate::local_player::LocalFlacTrack {
+                path: first.path,
+                title: first.title,
+                artists: vec![first.artists],
+                album: first.album,
+                duration_ms: first.duration_ms,
+                playlist_id: Some(first.playlist_id),
+                track_id: Some(first.track_id),
+                quality_label: first.quality,
+                sample_rate_hz: Some(96_000),
+                bit_depth: Some(24),
+            });
+        }
+        let (drawn, _tree) = run_demo_frame(&ctx, &mut app, egui::vec2(1280.0, 900.0));
+        assert!(
+            drawn.iter().any(|t| t == "Synced Library"),
+            "Synced Library heading missing"
+        );
+        assert!(
+            drawn.iter().any(|t| t == "Play all"),
+            "Play all button missing"
+        );
+        assert!(
+            drawn.iter().any(|t| t == "24-bit / 96 kHz FLAC"),
+            "lossless quality badge missing from library rows"
+        );
+        assert!(
+            drawn.iter().any(|t| t == "FLAC 24-bit / 96 kHz"),
+            "player bar lossless badge missing when local_flac is active; drawn={drawn:?}"
+        );
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn sync_ui_stays_fast_with_200_track_snapshot() {
+        use crate::sync_bridge::{SyncedLibraryTrack, TrackSyncInfo};
+        use spotisync::SyncStatus;
+        use std::path::PathBuf;
+
+        let (ctx, mut app) = accessible_app("sync-200-stress");
+        let statuses = [
+            SyncStatus::Done,
+            SyncStatus::Downloading,
+            SyncStatus::Resolving,
+            SyncStatus::Pending,
+            SyncStatus::Unmatched,
+            SyncStatus::Failed,
+        ];
+        app.sync_state.track_statuses.clear();
+        app.sync_state.library_tracks.clear();
+        for i in 0..200usize {
+            let status = statuses[i % statuses.len()];
+            let tid = format!("stress_trk_{i:03}");
+            let path = (status == SyncStatus::Done)
+                .then(|| PathBuf::from(format!("demo-library/Artist/Album/{i:03} - Track.flac")));
+            app.sync_state.track_statuses.insert(
+                ("pl1".into(), tid.clone()),
+                TrackSyncInfo {
+                    status,
+                    matched_by: (status == SyncStatus::Done).then(|| "isrc".into()),
+                    provider: Some("qobuz".into()),
+                    quality: (status == SyncStatus::Done).then(|| "24-bit / 96 kHz FLAC".into()),
+                    path: path.clone(),
+                    error: (status == SyncStatus::Failed).then(|| "HTTP 503".into()),
+                },
+            );
+            if let Some(path) = path {
+                app.sync_state.library_tracks.push(SyncedLibraryTrack {
+                    playlist_id: "pl1".into(),
+                    track_id: tid,
+                    title: format!("Stress Track {i}"),
+                    artists: "Bonobo".into(),
+                    album: "Fragments".into(),
+                    duration_ms: 210_000,
+                    quality: Some("24-bit / 96 kHz FLAC".into()),
+                    provider: Some("qobuz".into()),
+                    path,
+                });
+            }
+        }
+        app.sync_state.snapshot.done = 34;
+        app.sync_state.snapshot.downloading = 34;
+        app.sync_state.snapshot.resolving = 33;
+        app.sync_state.snapshot.pending = 33;
+        app.sync_state.snapshot.unmatched = 33;
+        app.sync_state.snapshot.failed = 33;
+
+        for page in [
+            Page::SyncQueue,
+            Page::SyncedLibrary,
+            Page::Playlist("pl1".into()),
+        ] {
+            app.open(page.clone());
+            // Warm up one frame so fonts and caches are initialized.
+            let _ = run_demo_frame(&ctx, &mut app, egui::vec2(1280.0, 900.0));
+            let start = Instant::now();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| app.frame_ui(ui),
+            );
+            output.textures_delta.clear();
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_millis(250),
+                "{page:?} with 200 sync tracks took {elapsed:?} for a single frame"
+            );
+        }
         app.backend.shutdown();
     }
 }

@@ -235,6 +235,50 @@ pub fn app_icon_rgba(size: usize) -> Vec<u8> {
     mark_rgba(size, true)
 }
 
+/// Tray icon variant overlaid with a bottom-right badge dot while lossless
+/// library syncing is active.
+pub fn app_icon_sync_badge_rgba(size: usize) -> Vec<u8> {
+    let mut rgba = app_icon_rgba(size);
+    draw_sync_badge(
+        &mut rgba,
+        size,
+        [0x38, 0xbd, 0xf8, 0xff],
+        [0x0f, 0x17, 0x2a, 0xff],
+    );
+    rgba
+}
+
+/// macOS menu-bar template icon variant with a bottom-right sync indicator dot.
+pub fn tray_template_sync_badge_rgba(size: usize) -> Vec<u8> {
+    let mut rgba = tray_template_rgba(size);
+    draw_sync_badge(&mut rgba, size, [0, 0, 0, 255], [0, 0, 0, 0]);
+    rgba
+}
+
+fn draw_sync_badge(rgba: &mut [u8], size: usize, dot: [u8; 4], ring: [u8; 4]) {
+    if size == 0 {
+        return;
+    }
+    let s = size as f32;
+    let cx = s * 0.78;
+    let cy = s * 0.78;
+    let dot_r = (s * 0.17).max(2.0);
+    let ring_r = dot_r + (s * 0.05).max(1.0);
+    for y in 0..size {
+        for x in 0..size {
+            let dx = (x as f32 + 0.5) - cx;
+            let dy = (y as f32 + 0.5) - cy;
+            let dist = dx.hypot(dy);
+            let idx = (y * size + x) * 4;
+            if dist <= dot_r {
+                rgba[idx..idx + 4].copy_from_slice(&dot);
+            } else if dist <= ring_r {
+                rgba[idx..idx + 4].copy_from_slice(&ring);
+            }
+        }
+    }
+}
+
 /// Mixes two colours, `t` of the way from `a` to `b`.
 fn mix(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     let t = t.clamp(0.0, 1.0);
@@ -484,6 +528,12 @@ mod tests {
         let template = tray_template_rgba(44);
         assert_eq!(pixel(&template, 44, 24, 22)[3], 0);
         assert_eq!(pixel(&template, 44, 8, 22), [0, 0, 0, 255]);
+
+        // #and the sync-badged tray icons paint a visible bottom-right dot
+        let badged = app_icon_sync_badge_rgba(32);
+        assert_eq!(pixel(&badged, 32, 25, 25), [0x38, 0xbd, 0xf8, 0xff]);
+        let badged_template = tray_template_sync_badge_rgba(44);
+        assert_eq!(pixel(&badged_template, 44, 34, 34), [0, 0, 0, 255]);
     }
 
     #[test]

@@ -1916,7 +1916,24 @@ fn playable(kind: ExtensionKind, bytes: &[u8]) -> Option<PlayableItem> {
     }
 }
 
+/// The first ISRC that is not blank. A blank entry ahead of a real one must
+/// not hide it.
+fn first_isrc<'a>(external_ids: impl IntoIterator<Item = (&'a str, &'a str)>) -> Option<String> {
+    external_ids
+        .into_iter()
+        .filter(|(external_type, _)| external_type.eq_ignore_ascii_case("isrc"))
+        .map(|(_, id)| id.trim())
+        .find(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
 fn track(track: SessionTrack) -> Track {
+    let isrc = first_isrc(
+        track
+            .external_ids
+            .iter()
+            .map(|ext| (ext.external_type.as_str(), ext.id.as_str())),
+    );
     Track {
         id: Some(track.id.to_id()),
         uri: track.id.to_uri(),
@@ -1928,6 +1945,7 @@ fn track(track: SessionTrack) -> Track {
         track_number: Some(u32::try_from(track.number).unwrap_or_default()),
         disc_number: Some(u32::try_from(track.disc_number).unwrap_or_default()),
         popularity: Some(track.popularity.clamp(0, 100) as u8),
+        external_ids: crate::api::models::ExternalIds { isrc },
         ..Default::default()
     }
 }
@@ -1996,6 +2014,20 @@ fn iso8601(timestamp_ms: i64) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A blank ISRC ahead of a real one must not hide it; only ISRCs count,
+    /// and a blank or missing one gives none.
+    #[test]
+    fn first_isrc_skips_blank_entries_before_a_real_one() {
+        use super::first_isrc;
+        assert_eq!(
+            first_isrc([("isrc", "  "), ("ISRC", " USRC17607839 "), ("isrc", "X")]),
+            Some("USRC17607839".to_string())
+        );
+        assert_eq!(first_isrc([("upc", "123"), ("isrc", "")]), None);
+        assert_eq!(first_isrc([("isrc", "   ")]), None);
+        assert_eq!(first_isrc(std::iter::empty()), None);
+    }
 
     /// Pathfinder's counts arrive as strings of digits; rows without a
     /// track URI or a count are left out, and every row counts toward the

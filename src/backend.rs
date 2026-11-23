@@ -970,6 +970,46 @@ pub enum Command {
         engine_generation: u64,
         result: Result<bool, String>,
     },
+    // Sync & local lossless playback
+    SyncSetPlaylist {
+        playlist_id: String,
+        playlist_name: String,
+        enabled: bool,
+    },
+    SyncTriggerNow,
+    SyncRetryTrack {
+        playlist_id: String,
+        track_id: String,
+    },
+    SyncUpdateConfig {
+        settings: crate::settings::SyncSettings,
+        resolved_root: std::path::PathBuf,
+    },
+    SyncSaveQobuzCredentials {
+        app_id: String,
+        user_auth_token: String,
+        app_secret: Option<String>,
+    },
+    SyncClearQobuzCredentials,
+    SyncValidateQobuzCredentials,
+    SyncChooseLibraryRoot {
+        selected:
+            std::pin::Pin<Box<dyn std::future::Future<Output = Option<rfd::FileHandle>> + Send>>,
+    },
+    PlaySyncedTrack {
+        track: Box<crate::local_player::LocalFlacTrack>,
+        queue: Vec<crate::local_player::LocalFlacTrack>,
+        index: usize,
+    },
+    LocalFlacPlayPause,
+    LocalFlacNext,
+    LocalFlacPrevious,
+    LocalFlacSeek(u64),
+    LocalFlacStop,
+    LocalFlacSetVolume(u8),
+    LocalFlacSetMuted(bool),
+    /// Opens the folder of a synced track, or the folder holding the file.
+    OpenTrackFolder(std::path::PathBuf),
 }
 
 pub struct LyricsRequest {
@@ -1159,6 +1199,10 @@ pub enum Event {
         playlists: Option<Vec<Playlist>>,
         home: Option<crate::model::HomeSnapshot>,
     },
+    // Sync & local lossless playback
+    SyncState(crate::sync_bridge::SyncUiState),
+    LocalFlacState(crate::local_player::LocalFlacState),
+    SyncLibraryRootChosen(std::path::PathBuf),
 }
 
 /// The state of playback on this computer, independent of Web API sign-in.
@@ -1234,6 +1278,8 @@ impl Backend {
         dirs: AppDirs,
         engine_config: EngineConfig,
         web_client_id: Option<String>,
+        sync_settings: crate::settings::SyncSettings,
+        sync_root: std::path::PathBuf,
         waker: Waker,
         restore_sign_in: bool,
     ) -> Self {
@@ -1281,6 +1327,7 @@ impl Backend {
                     worker.soloist_output_volume = worker_output_volume;
                     if restore_sign_in {
                         worker.restore_session();
+                        worker.start_sync(sync_settings, sync_root);
                     }
                     worker.run(command_rx).await;
                 });
@@ -1375,6 +1422,15 @@ impl Backend {
                     | Command::CheckForUpdates { .. }
                     | Command::DownloadUpdate { .. }
                     | Command::InstallUpdate { .. }
+                    | Command::PlaySyncedTrack { .. }
+                    | Command::LocalFlacPlayPause
+                    | Command::LocalFlacNext
+                    | Command::LocalFlacPrevious
+                    | Command::LocalFlacSeek(_)
+                    | Command::LocalFlacStop
+                    | Command::LocalFlacSetVolume(_)
+                    | Command::LocalFlacSetMuted(_)
+                    | Command::OpenTrackFolder(_)
             )
         {
             return;
@@ -1408,6 +1464,19 @@ impl Backend {
             .set_title("Choose the local files folder")
             .pick_folder();
         self.send(Command::ChooseLocalFilesFolder {
+            selected: Box::pin(selected),
+        });
+    }
+
+    /// Construct the folder dialog for the lossless sync library root on the UI thread.
+    pub fn choose_sync_library_root(&self) {
+        if self.offline {
+            return;
+        }
+        let selected = rfd::AsyncFileDialog::new()
+            .set_title("Choose synced library folder")
+            .pick_folder();
+        self.send(Command::SyncChooseLibraryRoot {
             selected: Box::pin(selected),
         });
     }
@@ -1939,6 +2008,9 @@ struct Worker {
     /// The user asked to set up playback and the saved grant is being tried
     /// first. Only Spotify rejecting it opens the browser.
     authorize_if_rejected: bool,
+    // Sync & local lossless playback
+    sync: Option<crate::sync_bridge::SyncController>,
+    local_flac: crate::local_player::LocalFlacPlayer,
 }
 
 /// A failed Connect probe setup must still reconcile departed provisional rows.
@@ -1976,6 +2048,22 @@ impl Worker {
         commands: mpsc::UnboundedSender<Command>,
         waker: Waker,
     ) -> Self {
+        let flac_events = events.clone();
+        let flac_waker = waker.clone();
+        let local_flac = crate::local_player::LocalFlacPlayer::new(
+            engine_config.eq.clone(),
+            Arc::clone(&engine_config.tap),
+            engine_config.audio_device.clone(),
+            engine_config.buffer_ms,
+            Arc::new(move |state| {
+                let _ = flac_events.send(Event::LocalFlacState(state));
+                flac_waker.wake();
+            }),
+        );
+        let initial_vol =
+            ((u32::from(engine_config.initial_volume) * 100 + 32_767) / 65_535).min(100) as u8;
+        local_flac.set_volume(initial_vol);
+
         Self {
             soloist_output_volume: crate::soloist::OutputVolume::default(),
             soloist: None,
@@ -2038,7 +2126,30 @@ impl Worker {
             engine_retry_generation: 0,
             engine_retry_quiet: false,
             authorize_if_rejected: false,
+            sync: None,
+            local_flac,
         }
+    }
+
+    /// Starts the background lossless sync coordinator on the backend runtime.
+    fn start_sync(&mut self, settings: crate::settings::SyncSettings, root: std::path::PathBuf) {
+        let source = Arc::new(crate::sync_bridge::SpotifyPlaylistSource::new(Arc::clone(
+            &self.api,
+        )));
+        let events = self.events.clone();
+        let waker = self.waker.clone();
+        let on_state = Arc::new(move |state| {
+            let _ = events.send(Event::SyncState(state));
+            waker.wake();
+        });
+        self.sync = Some(crate::sync_bridge::SyncController::start(
+            self.dirs.clone(),
+            self.credentials.clone(),
+            source,
+            settings,
+            root,
+            on_state,
+        ));
     }
 
     fn emit(&self, event: Event) {
@@ -2437,6 +2548,8 @@ impl Worker {
                     // Audio settings must not revert a proxy change whose UI
                     // acknowledgement was still in flight when this was clicked.
                     config.proxy = self.engine_config.proxy.clone();
+                    self.local_flac
+                        .set_audio_device(config.audio_device.clone(), config.buffer_ms);
                     self.engine_config = config;
                     self.replace_engine();
                 }
@@ -2449,6 +2562,12 @@ impl Worker {
                 }
                 Command::ApplyProxy { request, config } => self.change_proxy(request, config, None),
                 Command::Player(command) => {
+                    if matches!(
+                        &command,
+                        PlayerCommand::Load(_) | PlayerCommand::Toggle | PlayerCommand::Transfer
+                    ) {
+                        self.local_flac.stop();
+                    }
                     if matches!(&command, PlayerCommand::Load(_)) {
                         self.resume = None;
                     }
@@ -2481,6 +2600,18 @@ impl Worker {
                 }
                 Command::Api(ApiRequest::Search { query, serial }) => self.search(query, serial),
                 Command::Api(request) => {
+                    // A Spotify play, or a transfer that starts playing, takes
+                    // over from the local FLAC song.
+                    if matches!(
+                        &request,
+                        ApiRequest::Remote {
+                            action: RemoteAction::Play,
+                            ..
+                        } | ApiRequest::ShufflePlay { .. }
+                            | ApiRequest::Transfer { play: true, .. }
+                    ) {
+                        self.local_flac.stop();
+                    }
                     if let ApiRequest::PlaybackState { seq } = &request {
                         self.connect.poll_sent(*seq, self.cluster_playing());
                     }
@@ -2977,8 +3108,118 @@ impl Worker {
                 Command::ConfigurePersonalWebApp(client_id) => {
                     self.configure_personal_web_app(client_id)
                 }
+                // Sync & local lossless playback
+                Command::SyncSetPlaylist {
+                    playlist_id,
+                    playlist_name,
+                    enabled,
+                } => {
+                    if let Some(sync) = &self.sync {
+                        sync.set_playlist(playlist_id, playlist_name, enabled);
+                    }
+                }
+                Command::SyncTriggerNow => {
+                    if let Some(sync) = &self.sync {
+                        sync.trigger_now();
+                    }
+                }
+                Command::SyncRetryTrack {
+                    playlist_id,
+                    track_id,
+                } => {
+                    if let Some(sync) = &self.sync {
+                        sync.retry_track(playlist_id, track_id);
+                    }
+                }
+                Command::SyncUpdateConfig {
+                    settings,
+                    resolved_root,
+                } => {
+                    if let Some(sync) = &self.sync {
+                        sync.update_config(settings, resolved_root);
+                    }
+                }
+                Command::SyncSaveQobuzCredentials {
+                    app_id,
+                    user_auth_token,
+                    app_secret,
+                } => {
+                    if let Some(sync) = &self.sync {
+                        sync.save_qobuz_credentials(app_id, user_auth_token, app_secret);
+                    }
+                }
+                Command::SyncClearQobuzCredentials => {
+                    if let Some(sync) = &self.sync {
+                        sync.clear_qobuz_credentials();
+                    }
+                }
+                Command::SyncValidateQobuzCredentials => {
+                    if let Some(sync) = &self.sync {
+                        sync.validate_qobuz_credentials();
+                    }
+                }
+                Command::SyncChooseLibraryRoot { selected } => {
+                    let events = self.events.clone();
+                    let waker = self.waker.clone();
+                    tokio::spawn(async move {
+                        if let Some(folder) = selected.await {
+                            let _ = events
+                                .send(Event::SyncLibraryRootChosen(folder.path().to_path_buf()));
+                            waker.wake();
+                        }
+                    });
+                }
+                Command::PlaySyncedTrack {
+                    track,
+                    queue,
+                    index,
+                } => {
+                    if let Some(engine) = &self.engine {
+                        engine.pause_if_playing();
+                    }
+                    // A Spotify song waiting to be picked up after a dropped
+                    // session must not start over the local one.
+                    self.resume = None;
+                    self.resume_verify = None;
+                    self.stop_kept_player();
+                    self.local_flac.play_track(*track, queue, index);
+                }
+                Command::LocalFlacPlayPause => self.local_flac.play_pause(),
+                Command::LocalFlacNext => self.local_flac.next(),
+                Command::LocalFlacPrevious => self.local_flac.previous(),
+                Command::LocalFlacSeek(position_ms) => self.local_flac.seek(position_ms),
+                Command::LocalFlacStop => self.local_flac.stop(),
+                Command::LocalFlacSetVolume(percent) => self.local_flac.set_volume(percent),
+                Command::LocalFlacSetMuted(muted) => self.local_flac.set_muted(muted),
+                Command::OpenTrackFolder(path) => {
+                    // The file system is looked at here, off the UI thread.
+                    let events = self.events.clone();
+                    let waker = self.waker.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let folder = if path.is_dir() {
+                            path
+                        } else {
+                            path.parent()
+                                .map(std::path::Path::to_path_buf)
+                                .unwrap_or(path)
+                        };
+                        if let Err(error) = std::fs::create_dir_all(&folder)
+                            .and_then(|()| crate::opener::open(&folder))
+                        {
+                            let _ = events.send(Event::Error(format!(
+                                "Couldn't open {}: {error}",
+                                folder.display()
+                            )));
+                            waker.wake();
+                        }
+                    });
+                }
             }
         }
+        if let Some(sync) = self.sync.take() {
+            sync.shutdown();
+        }
+        self.local_flac.stop();
         if let Some(engine) = self.engine.take() {
             engine.shutdown();
         }
@@ -3091,7 +3332,8 @@ impl Worker {
                     }
                 }
             }
-            None | Some(StoredGrant::Proxy(_) | StoredGrant::Soloist(_)) => {}
+            None
+            | Some(StoredGrant::Proxy(_) | StoredGrant::Soloist(_) | StoredGrant::Qobuz(_)) => {}
         }
         if slot == CredentialSlot::Playback {
             self.start_prerelease();
