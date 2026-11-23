@@ -4,6 +4,12 @@
 //! strict metadata and ISRC matching, tracks progress in a resumable SQLite
 //! store, writes FLAC files atomically with full tags, and watches playlists
 //! for new additions.
+//!
+//! This milestone (M0) only ships the provider layer, the matching rules, the
+//! queue and rate-limit types, and the shared data types. [`SyncStore`],
+//! [`PlaylistWatcher`] and the writer in [`writer`] are placeholders: they
+//! carry no behaviour yet. SQLite persistence lands in M2, the playlist
+//! watcher in M3, and the atomic FLAC writer and tagger in M2.
 
 pub mod matching;
 pub mod providers;
@@ -56,6 +62,11 @@ pub enum SyncError {
     /// Provider only offered a lossy or non-FLAC stream.
     #[error("lossy stream rejected: {0}")]
     LossyOnly(String),
+
+    /// Provider served only a preview sample for this track. The credentials
+    /// are valid, so this is a per-track failure, not an authentication one.
+    #[error("preview sample only: {0}")]
+    PreviewOnly(String),
 
     /// Downloaded audio payload failed FLAC validation.
     #[error("invalid audio data: {0}")]
@@ -120,10 +131,13 @@ impl SyncError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Quality {
     /// Standard CD-quality lossless FLAC (16-bit / 44.1 kHz).
+    #[serde(rename = "flac_16_44", alias = "Flac16_44")]
     Flac16_44,
     /// Hi-Res lossless FLAC (24-bit / up to 96 kHz).
+    #[serde(rename = "flac_24_96", alias = "Flac24_96")]
     Flac24_96,
     /// Studio Master lossless FLAC (24-bit / up to 192 kHz).
+    #[serde(rename = "flac_24_192", alias = "Flac24_192")]
     Flac24_192,
 }
 
@@ -274,5 +288,22 @@ mod tests {
             assert_eq!(Quality::parse(q.as_str()), Some(q));
         }
         assert_eq!(Quality::parse("mp3_320"), None);
+    }
+
+    #[test]
+    fn quality_serde_uses_canonical_strings() {
+        for q in [Quality::Flac16_44, Quality::Flac24_96, Quality::Flac24_192] {
+            let json = serde_json::to_string(&q).expect("serialize quality");
+            assert_eq!(json, format!("\"{}\"", q.as_str()));
+            let back: Quality = serde_json::from_str(&json).expect("deserialize quality");
+            assert_eq!(back, q);
+            assert_eq!(Quality::parse(json.trim_matches('"')), Some(q));
+        }
+    }
+
+    #[test]
+    fn quality_serde_accepts_legacy_variant_names() {
+        let legacy: Quality = serde_json::from_str("\"Flac24_96\"").expect("legacy name");
+        assert_eq!(legacy, Quality::Flac24_96);
     }
 }
