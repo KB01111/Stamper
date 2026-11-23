@@ -3,6 +3,7 @@ use spotisync::matching::{MatchConfig, MatchOutcome, MatchedBy, RejectReason, se
 use spotisync::{Candidate, Quality, Query};
 
 const MATCHING_FIXTURE: &str = include_str!("fixtures/matching_50_tracks.json");
+const REVIEW_FIXTURE: &str = include_str!("fixtures/matching_review_cases.json");
 
 #[derive(Debug, Deserialize)]
 struct FixtureCase {
@@ -21,6 +22,8 @@ struct FixtureCandidate {
     isrc: Option<String>,
     title: String,
     artists: Vec<String>,
+    #[serde(default)]
+    album_artist: Option<String>,
     duration_ms: u64,
     bit_depth: Option<u8>,
     sample_rate_hz: Option<u32>,
@@ -36,7 +39,7 @@ impl From<FixtureCandidate> for Candidate {
             title: c.title,
             artists: c.artists,
             album: None,
-            album_artist: None,
+            album_artist: c.album_artist,
             track_number: None,
             disc_number: None,
             year: None,
@@ -62,12 +65,26 @@ struct ExpectedOutcome {
     reason: Option<String>,
 }
 
-#[test]
-fn fifty_track_matching_fixture_accuracy_and_zero_wrong_recordings() {
-    let cases: Vec<FixtureCase> =
-        serde_json::from_str(MATCHING_FIXTURE).expect("50-track fixture JSON parses");
-    assert_eq!(cases.len(), 50, "fixture suite must contain 50 tracks");
+/// Result of running every fixture case through the matcher.
+struct Evaluation {
+    total: usize,
+    correct: usize,
+    wrong_recording_matches: usize,
+    failures: Vec<String>,
+}
 
+impl Evaluation {
+    fn accuracy_percent(&self) -> f64 {
+        (self.correct as f64 / self.total as f64) * 100.0
+    }
+}
+
+fn parse_cases(json: &str) -> Vec<FixtureCase> {
+    serde_json::from_str(json).expect("matching fixture JSON parses")
+}
+
+fn evaluate(cases: Vec<FixtureCase>) -> Evaluation {
+    let total = cases.len();
     let mut correct = 0usize;
     let mut wrong_recording_matches = 0usize;
     let mut failures = Vec::new();
@@ -133,22 +150,47 @@ fn fifty_track_matching_fixture_accuracy_and_zero_wrong_recordings() {
         }
     }
 
-    let accuracy = (correct as f64 / 50.0) * 100.0;
-    assert_eq!(
+    Evaluation {
+        total,
+        correct,
         wrong_recording_matches,
-        0,
-        "must have 0 wrong-recording matches; failures:\n{}",
-        failures.join("\n")
-    );
+        failures,
+    }
+}
+
+#[test]
+fn fifty_track_matching_fixture_accuracy_and_zero_wrong_recordings() {
+    let cases = parse_cases(MATCHING_FIXTURE);
+    assert_eq!(cases.len(), 50, "fixture suite must contain 50 tracks");
+
+    let report = evaluate(cases);
     assert!(
-        accuracy > 95.0,
-        "matching accuracy {accuracy:.1}% ({correct}/50) below 95%; failures:\n{}",
-        failures.join("\n")
+        report.failures.is_empty(),
+        "{} of {} fixtures failed ({} wrong-recording matches, accuracy {:.1}%):\n{}",
+        report.failures.len(),
+        report.total,
+        report.wrong_recording_matches,
+        report.accuracy_percent(),
+        report.failures.join("\n")
     );
+}
+
+#[test]
+fn review_regression_fixtures_hold() {
+    let cases = parse_cases(REVIEW_FIXTURE);
     assert!(
-        failures.is_empty(),
-        "unexpected fixture mismatches:\n{}",
-        failures.join("\n")
+        !cases.is_empty(),
+        "review regression suite must not be empty"
+    );
+
+    let report = evaluate(cases);
+    assert!(
+        report.failures.is_empty(),
+        "{} of {} review regression fixtures failed ({} wrong-recording matches):\n{}",
+        report.failures.len(),
+        report.total,
+        report.wrong_recording_matches,
+        report.failures.join("\n")
     );
 }
 
