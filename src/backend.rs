@@ -1008,6 +1008,8 @@ pub enum Command {
     LocalFlacStop,
     LocalFlacSetVolume(u8),
     LocalFlacSetMuted(bool),
+    /// Opens the folder of a synced track, or the folder holding the file.
+    OpenTrackFolder(std::path::PathBuf),
 }
 
 pub struct LyricsRequest {
@@ -1428,6 +1430,7 @@ impl Backend {
                     | Command::LocalFlacStop
                     | Command::LocalFlacSetVolume(_)
                     | Command::LocalFlacSetMuted(_)
+                    | Command::OpenTrackFolder(_)
             )
         {
             return;
@@ -2597,12 +2600,15 @@ impl Worker {
                 }
                 Command::Api(ApiRequest::Search { query, serial }) => self.search(query, serial),
                 Command::Api(request) => {
+                    // A Spotify play, or a transfer that starts playing, takes
+                    // over from the local FLAC song.
                     if matches!(
                         &request,
                         ApiRequest::Remote {
                             action: RemoteAction::Play,
                             ..
                         } | ApiRequest::ShufflePlay { .. }
+                            | ApiRequest::Transfer { play: true, .. }
                     ) {
                         self.local_flac.stop();
                     }
@@ -3171,6 +3177,10 @@ impl Worker {
                     if let Some(engine) = &self.engine {
                         engine.pause_if_playing();
                     }
+                    // A Spotify song waiting to be picked up after a dropped
+                    // session must not start over the local one.
+                    self.resume = None;
+                    self.resume_verify = None;
                     self.stop_kept_player();
                     self.local_flac.play_track(*track, queue, index);
                 }
@@ -3181,6 +3191,29 @@ impl Worker {
                 Command::LocalFlacStop => self.local_flac.stop(),
                 Command::LocalFlacSetVolume(percent) => self.local_flac.set_volume(percent),
                 Command::LocalFlacSetMuted(muted) => self.local_flac.set_muted(muted),
+                Command::OpenTrackFolder(path) => {
+                    // The file system is looked at here, off the UI thread.
+                    let events = self.events.clone();
+                    let waker = self.waker.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let folder = if path.is_dir() {
+                            path
+                        } else {
+                            path.parent()
+                                .map(std::path::Path::to_path_buf)
+                                .unwrap_or(path)
+                        };
+                        if let Err(error) = std::fs::create_dir_all(&folder)
+                            .and_then(|()| crate::opener::open(&folder))
+                        {
+                            let _ = events.send(Event::Error(format!(
+                                "Couldn't open {}: {error}",
+                                folder.display()
+                            )));
+                            waker.wake();
+                        }
+                    });
+                }
             }
         }
         if let Some(sync) = self.sync.take() {
