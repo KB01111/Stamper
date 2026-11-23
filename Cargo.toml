@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/spotisync"]
+resolver = "3"
+
 [package]
 name = "spotifast"
 default-run = "spotifast"
