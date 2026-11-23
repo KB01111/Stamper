@@ -504,6 +504,7 @@ pub fn actions_row(
                         refresh_menu_item(app, ui, page, *loading);
                     }
                 });
+            super::sync::playlist_sync_pill(app, ui, uri);
         }
         if let Some(filter) = filter {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

@@ -846,6 +846,24 @@ impl Engine {
         let _ = self.spirc.shutdown();
     }
 
+    /// Pauses librespot playback cleanly when playing or still loading (for
+    /// example, before starting direct local FLAC playback). A song still
+    /// loading is paused too: librespot then cancels its start once it has
+    /// loaded, instead of letting it play out over the local song.
+    pub fn pause_if_playing(&self) {
+        self.stop_carrying();
+        let active = matches!(
+            self.state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .playback,
+            Playback::Playing | Playback::Loading
+        );
+        if active && let Err(error) = self.spirc.pause() {
+            log::warn!("unable to pause Spotify playback: {error}");
+        }
+    }
+
     pub fn resume_point(&self) -> Option<PlaybackResume> {
         if let Some(snapshot) = self.spirc.disconnected_playback() {
             return Some(PlaybackResume::Session(snapshot));

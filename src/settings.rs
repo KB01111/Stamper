@@ -258,6 +258,101 @@ impl SlowAppBanner {
     pub const MAX_DISMISSALS: u8 = 3;
 }
 
+/// Maximum lossless quality tier requested from sync providers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncQualityCeiling {
+    Flac16_44,
+    Flac24_96,
+    #[default]
+    Flac24_192,
+}
+
+impl SyncQualityCeiling {
+    pub const ALL: [Self; 3] = [Self::Flac16_44, Self::Flac24_96, Self::Flac24_192];
+
+    pub fn to_spotisync(&self) -> spotisync::Quality {
+        match self {
+            Self::Flac16_44 => spotisync::Quality::Flac16_44,
+            Self::Flac24_96 => spotisync::Quality::Flac24_96,
+            Self::Flac24_192 => spotisync::Quality::Flac24_192,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Flac16_44 => "FLAC 16-bit / 44.1 kHz",
+            Self::Flac24_96 => "FLAC 24-bit / 96 kHz",
+            Self::Flac24_192 => "FLAC 24-bit / 192 kHz",
+        }
+    }
+}
+
+/// Ordered provider priority entry for lossless playlist syncing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncProviderConfig {
+    pub id: String,
+    pub enabled: bool,
+}
+
+impl Default for SyncProviderConfig {
+    fn default() -> Self {
+        Self {
+            id: "qobuz".into(),
+            enabled: true,
+        }
+    }
+}
+
+/// Persisted toggle for one Spotify playlist tracked by lossless sync.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncedPlaylistSetting {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+}
+
+/// Non-secret preferences for lossless playlist syncing. Provider tokens and
+/// secrets live in the platform credential store, never in settings JSON.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncSettings {
+    pub library_root: Option<String>,
+    pub providers: Vec<SyncProviderConfig>,
+    pub quality_ceiling: SyncQualityCeiling,
+    pub concurrency: u8,
+    pub poll_interval_secs: u64,
+    pub synced_playlists: Vec<SyncedPlaylistSetting>,
+}
+
+impl Default for SyncSettings {
+    fn default() -> Self {
+        Self {
+            library_root: None,
+            providers: vec![SyncProviderConfig {
+                id: "qobuz".into(),
+                enabled: true,
+            }],
+            quality_ceiling: SyncQualityCeiling::Flac24_192,
+            concurrency: 2,
+            poll_interval_secs: 60,
+            synced_playlists: Vec::new(),
+        }
+    }
+}
+
+impl SyncSettings {
+    pub fn clamped_concurrency(&self) -> u8 {
+        self.concurrency.clamp(1, 8)
+    }
+
+    pub fn clamped_poll_interval_secs(&self) -> u64 {
+        self.poll_interval_secs.clamp(15, 3600)
+    }
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -477,6 +572,10 @@ pub struct Settings {
     /// succeeds. This flag is only in memory and is never persisted.
     #[serde(skip)]
     pub proxy_password_legacy: bool,
+    /// Lossless playlist sync preferences (non-secret; provider tokens stay
+    /// in the platform credential store).
+    #[serde(default)]
+    pub sync: SyncSettings,
 }
 
 impl std::fmt::Debug for Settings {
@@ -588,6 +687,7 @@ impl Default for Settings {
             proxy_username: String::new(),
             proxy_password: String::new(),
             proxy_password_legacy: false,
+            sync: SyncSettings::default(),
         }
     }
 }
@@ -603,6 +703,25 @@ impl Settings {
             .as_deref()
             .filter(|folder| !folder.trim().is_empty())
             .map(std::path::PathBuf::from)
+    }
+
+    /// Destination folder for synced lossless FLAC files: custom
+    /// `sync.library_root` if set, else `<local_files_folder>/sync` if
+    /// `local_files_folder` is set, else `dirs.state.join("sync")`.
+    pub fn resolved_sync_root(&self, dirs: &crate::paths::AppDirs) -> std::path::PathBuf {
+        if let Some(root) = self
+            .sync
+            .library_root
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        {
+            return std::path::PathBuf::from(root);
+        }
+        if let Some(local) = self.local_files_folder() {
+            return local.join("sync");
+        }
+        dirs.state.join("sync")
     }
 
     /// The one palette shown whatever the system's appearance: a chosen
@@ -2108,5 +2227,60 @@ mod session_tests {
         );
         assert!(crate::util::temporary_files(path.parent().unwrap()).is_empty());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn old_settings_without_sync_load_with_defaults() {
+        let settings: super::Settings =
+            serde_json::from_str(r#"{"device_name":"Old","bitrate":320}"#).unwrap();
+        assert_eq!(settings.device_name, "Old");
+        assert_eq!(settings.sync.library_root, None);
+        assert_eq!(
+            settings.sync.quality_ceiling,
+            super::SyncQualityCeiling::Flac24_192
+        );
+        assert_eq!(settings.sync.concurrency, 2);
+        assert_eq!(settings.sync.poll_interval_secs, 60);
+        assert_eq!(
+            settings.sync.providers,
+            vec![super::SyncProviderConfig {
+                id: "qobuz".into(),
+                enabled: true,
+            }]
+        );
+        assert!(settings.sync.synced_playlists.is_empty());
+    }
+
+    #[test]
+    fn resolved_sync_root_follows_fallback_chain() {
+        let dirs = crate::paths::AppDirs {
+            config: std::path::PathBuf::from("/app/config"),
+            state: std::path::PathBuf::from("/app/state"),
+            cache: std::path::PathBuf::from("/app/cache"),
+        };
+
+        let mut settings = super::Settings::default();
+        assert_eq!(
+            settings.resolved_sync_root(&dirs),
+            std::path::PathBuf::from("/app/state/sync")
+        );
+
+        settings.local_files_folder = Some("/music/local".into());
+        assert_eq!(
+            settings.resolved_sync_root(&dirs),
+            std::path::PathBuf::from("/music/local/sync")
+        );
+
+        settings.sync.library_root = Some("/lossless/archive".into());
+        assert_eq!(
+            settings.resolved_sync_root(&dirs),
+            std::path::PathBuf::from("/lossless/archive")
+        );
+
+        settings.sync.library_root = Some("   ".into());
+        assert_eq!(
+            settings.resolved_sync_root(&dirs),
+            std::path::PathBuf::from("/music/local/sync")
+        );
     }
 }

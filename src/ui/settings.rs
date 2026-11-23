@@ -55,7 +55,7 @@ impl<'a> RowText<'a> {
         self
     }
 
-    fn matches(&self, needle: &str, section: &str) -> bool {
+    pub(super) fn matches(&self, needle: &str, section: &str) -> bool {
         self.available
             && (needle.is_empty()
                 || section.to_lowercase().contains(needle)
@@ -135,7 +135,7 @@ const RELEASE_NOTES_URL: &str = concat!(
     env!("CARGO_PKG_VERSION")
 );
 
-fn section_matches(needle: &str, title: &str, rows: &[RowText<'_>]) -> bool {
+pub(super) fn section_matches(needle: &str, title: &str, rows: &[RowText<'_>]) -> bool {
     let needle = needle.trim().to_lowercase();
     rows.iter().any(|row| row.matches(&needle, title))
 }
@@ -167,7 +167,7 @@ pub(super) fn filtered_note(
 }
 
 /// `filtered_row` for a control that needs `control_width` points.
-fn filtered_row_sized(
+pub(super) fn filtered_row_sized(
     ui: &mut egui::Ui,
     palette: &Palette,
     needle: &str,
@@ -221,7 +221,7 @@ fn slider_value_style(style: &mut egui::Style, palette: &Palette) {
 /// A settings slider with its value box beside it, where egui's own slider
 /// would put it. The two are drawn apart so each keeps its own rounding;
 /// `slider` and `value` set up each part for `number` over `range`.
-fn setting_slider<N: egui::emath::Numeric>(
+pub(super) fn setting_slider<N: egui::emath::Numeric>(
     ui: &mut egui::Ui,
     palette: &Palette,
     number: &mut N,
@@ -354,7 +354,7 @@ fn skin_part(
     ui.add_space(14.0);
 }
 
-fn section(
+pub(super) fn section(
     ui: &mut egui::Ui,
     palette: &Palette,
     title: &str,
@@ -1190,6 +1190,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 });
             }
         });
+    }
+
+    if super::sync::settings_section(app, ui, &needle) {
+        any_visible = true;
     }
 
     let appearance = gettext(locale, "Appearance");

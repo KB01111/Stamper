@@ -408,6 +408,17 @@ pub struct App {
     autostart_sent: Vec<crate::backend::AutostartRequest>,
     /// Whether the tray menu last offered Pause rather than Play.
     tray_playing: bool,
+    /// Whether the tray currently shows the active sync badge.
+    tray_sync_active: bool,
+    /// Last sync status label pushed to the tray menu and tooltip.
+    tray_sync_label: String,
+    // Sync & local lossless playback
+    pub sync_state: crate::sync_bridge::SyncUiState,
+    pub local_flac: crate::local_player::LocalFlacState,
+    /// Unpersisted Qobuz credential form inputs (cleared once submitted).
+    pub sync_qobuz_app_id_input: String,
+    pub sync_qobuz_token_input: String,
+    pub sync_qobuz_secret_input: String,
     /// The system's power and session state.
     power: crate::power::Power,
     /// Whether the system's word on reaching the internet goes to the
@@ -950,6 +961,7 @@ const TRAY_MAIN_WINDOW: &str = "main-window";
 const TRAY_PLAY_PAUSE: &str = "play-pause";
 const TRAY_NEXT: &str = "next";
 const TRAY_PREVIOUS: &str = "previous";
+const TRAY_SYNC_STATUS: &str = "sync-status";
 const TRAY_QUIT: &str = "quit";
 
 /// What the shell around `eframe::run_native` does with the app between
@@ -1096,6 +1108,7 @@ fn tray_config() -> fastframe_tray::Config {
             MenuItem::action(TRAY_NEXT, "Next"),
             MenuItem::action(TRAY_PREVIOUS, "Previous"),
             MenuItem::Separator,
+            MenuItem::action(TRAY_SYNC_STATUS, "Sync idle").visible(false),
             MenuItem::action(TRAY_QUIT, "Quit"),
         ],
     }
@@ -1145,10 +1158,13 @@ impl App {
             std::sync::Arc::clone(&tap),
             std::sync::Arc::clone(&eq),
         );
+        let sync_root = settings.resolved_sync_root(&dirs);
         let backend = Backend::spawn(
             dirs.clone(),
             engine_config,
             settings.web_client_id.clone(),
+            settings.sync.clone(),
+            sync_root,
             waker.clone(),
             options.restore_sign_in,
         );
@@ -1243,6 +1259,13 @@ impl App {
             #[cfg(test)]
             autostart_sent: Vec::new(),
             tray_playing: false,
+            tray_sync_active: false,
+            tray_sync_label: String::new(),
+            sync_state: crate::sync_bridge::SyncUiState::default(),
+            local_flac: crate::local_player::LocalFlacState::default(),
+            sync_qobuz_app_id_input: String::new(),
+            sync_qobuz_token_input: String::new(),
+            sync_qobuz_secret_input: String::new(),
             power,
             follows_reachability: cfg!(target_os = "macos"),
             reachable: true,
@@ -2371,6 +2394,65 @@ impl App {
 
     /// What a device is actually playing, here or elsewhere.
     fn now_playing_live(&self) -> Option<NowPlaying> {
+        if self.local_flac.active
+            && let Some(track) = &self.local_flac.track
+        {
+            let cached = track
+                .track_id
+                .as_deref()
+                .and_then(|id| self.track_cache.get(id));
+            let art_url = cached.and_then(|t| t.image(640)).map(str::to_string);
+            let art_small = cached
+                .and_then(|t| t.image(64))
+                .map(str::to_string)
+                .or_else(|| art_url.clone());
+            let uri = track
+                .track_id
+                .as_deref()
+                .map(|id| format!("spotify:track:{id}"))
+                .unwrap_or_else(|| format!("file://{}", track.path.display()));
+            let artists = track
+                .artists
+                .iter()
+                .map(|name| ArtistRef {
+                    id: None,
+                    name: name.clone(),
+                    uri: None,
+                })
+                .collect();
+            let volume_percent = if self.local_flac.muted {
+                0
+            } else {
+                self.local_flac.volume_percent
+            };
+            return Some(NowPlaying {
+                local: true,
+                device_name: track.quality_label.clone(),
+                device_kind: None,
+                uri,
+                id: track.track_id.clone(),
+                title: track.title.clone(),
+                subtitle: track.artists.join(", "),
+                artists,
+                album_name: track.album.clone(),
+                album_id: cached.and_then(|t| t.album.as_ref()).map(|a| a.id.clone()),
+                show_id: None,
+                art_url,
+                art_small,
+                duration_ms: u32::try_from(self.local_flac.duration_ms.max(track.duration_ms))
+                    .unwrap_or(u32::MAX),
+                position_ms: u32::try_from(self.local_flac.position_ms).unwrap_or(u32::MAX),
+                playing: self.local_flac.playback == Playback::Playing,
+                loading: self.local_flac.playback == Playback::Loading,
+                shuffle: false,
+                repeat: RepeatMode::Off,
+                volume_percent,
+                can_control: true,
+                can_set_volume: true,
+                is_episode: false,
+                resuming: false,
+            });
+        }
         if self.local.is_active() && self.local_transfer_sequence != Some(self.local.track_sequence)
         {
             let track = self.local.track.as_ref()?;
@@ -2939,6 +3021,36 @@ impl App {
                     self.set_local_files_folder(Some(folder));
                 }
                 Event::LocalFilesFolderChosen(None) => {}
+                // Sync & local lossless playback
+                Event::SyncState(state) => {
+                    if self.sync_qobuz_app_id_input.is_empty()
+                        && let Some(hint) = &state.qobuz_app_id_hint
+                    {
+                        self.sync_qobuz_app_id_input = hint.clone();
+                    }
+                    self.sync_state = state;
+                    self.sync_tray_badge();
+                }
+                Event::LocalFlacState(state) => {
+                    if let Some(error) = &state.error
+                        && self.local_flac.error.as_deref() != Some(error.as_str())
+                    {
+                        self.toast_error(error.clone());
+                    }
+                    // Next and Previous move to another local song too.
+                    let previous = self.local_flac.track.as_ref().map(|track| &track.path);
+                    let changed =
+                        state.active && state.track.as_ref().map(|track| &track.path) != previous;
+                    self.local_flac = state;
+                    if changed {
+                        self.request_lyrics_for_local_track();
+                    }
+                }
+                Event::SyncLibraryRootChosen(folder) => {
+                    self.settings.sync.library_root = Some(folder.to_string_lossy().into_owned());
+                    self.mark_settings_dirty();
+                    self.push_sync_config();
+                }
                 Event::LocalFiles { folder, uris } => {
                     // A scan of a folder since replaced says nothing now.
                     if self.settings.local_files_folder().as_ref() == Some(&folder) {
@@ -3728,7 +3840,7 @@ impl App {
                     self.refresh_queue(true);
                 }
             }
-            Page::Settings => {}
+            Page::SyncedLibrary | Page::SyncQueue | Page::Settings => {}
         }
     }
 
@@ -4490,6 +4602,16 @@ impl App {
             },
             local_file,
         })));
+    }
+
+    /// Asks for the lyrics of the local song that starts or changes, when
+    /// lyrics are on screen. This frame's song is the old one, so it is
+    /// refreshed first.
+    fn request_lyrics_for_local_track(&mut self) {
+        if self.show_lyrics_panel || self.lyrics_fullscreen.is_some() {
+            self.refresh_frame_now();
+            self.request_lyrics();
+        }
     }
 
     /// Pushes the Winamp window's always-on-top level to the live window.
@@ -5673,6 +5795,10 @@ impl App {
                 Event::Menu(TRAY_PLAY_PAUSE) => Action::TogglePlay,
                 Event::Menu(TRAY_NEXT) => Action::Next,
                 Event::Menu(TRAY_PREVIOUS) => Action::Previous,
+                Event::Menu(TRAY_SYNC_STATUS) => {
+                    self.actions.push(Action::Open(Page::SyncQueue));
+                    Action::ShowWindow
+                }
                 Event::Menu(TRAY_QUIT) => Action::Quit,
                 Event::Menu(_) => continue,
             };
@@ -5930,6 +6056,7 @@ impl App {
             // Changes the item only when the setting did.
             tray.set_icon_colour(tray_icon_colour(self.settings.tray_icon));
         }
+        self.sync_tray_badge();
         #[cfg(target_os = "macos")]
         crate::mac_menu::set_playing(playing);
         if let Some(slot) = &self.control_now_playing {
@@ -5943,6 +6070,54 @@ impl App {
             *slot.lock().unwrap_or_else(|p| p.into_inner()) = snapshot;
             self.control_devices_stale = false;
         }
+    }
+
+    /// Updates the system tray icon badge, tooltip, and dynamic status item
+    /// while lossless playlist syncing is active, and restores the normal tray
+    /// icon once syncing finishes.
+    pub(crate) fn sync_tray_badge(&mut self) {
+        let Some(tray) = &mut self.tray else {
+            return;
+        };
+        let running = self.sync_state.active_running;
+        if running {
+            let snap = &self.sync_state.snapshot;
+            let remaining = snap.pending + snap.resolving + snap.downloading;
+            if !self.tray_sync_active {
+                tray.set_icon(
+                    util::app_icon_sync_badge_rgba,
+                    Some(util::tray_template_sync_badge_rgba),
+                );
+                tray.set_visible(TRAY_SYNC_STATUS, true);
+                self.tray_sync_active = true;
+            }
+            let label = format!("Syncing: {remaining} remaining");
+            if self.tray_sync_label != label {
+                let tooltip = format!(
+                    "Spotifast - Syncing {remaining} track{}",
+                    if remaining == 1 { "" } else { "s" }
+                );
+                tray.set_label(TRAY_SYNC_STATUS, label.clone());
+                tray.set_tooltip(tooltip);
+                self.tray_sync_label = label;
+            }
+        } else if self.tray_sync_active {
+            tray.set_icon(util::app_icon_rgba, Some(util::tray_template_rgba));
+            tray.set_tooltip("Spotifast");
+            tray.set_visible(TRAY_SYNC_STATUS, false);
+            self.tray_sync_active = false;
+            self.tray_sync_label.clear();
+        }
+    }
+
+    /// Pushes updated non-secret sync settings and resolved library root to the
+    /// background sync controller.
+    fn push_sync_config(&self) {
+        let resolved_root = self.settings.resolved_sync_root(&self.dirs);
+        self.backend.send(Command::SyncUpdateConfig {
+            settings: self.settings.sync.clone(),
+            resolved_root,
+        });
     }
 
     /// One line for the control channel's `nowplaying` verb: tab-separated
@@ -6538,6 +6713,7 @@ impl App {
                     self.refresh_queue(true);
                 }
             }
+            Page::SyncedLibrary | Page::SyncQueue => {}
             Page::Settings => self.refresh_autostart(),
         }
     }
@@ -11128,6 +11304,10 @@ impl App {
     }
 
     fn toggle_play(&mut self) {
+        if self.local_flac.active {
+            self.backend.send(Command::LocalFlacPlayPause);
+            return;
+        }
         let playing = self.now_playing().map(|now| now.playing);
         match self.target() {
             Target::Local => {
@@ -11199,6 +11379,12 @@ impl App {
     }
 
     fn seek(&mut self, position_ms: u32) {
+        if self.local_flac.active {
+            self.local_flac.position_ms = u64::from(position_ms);
+            self.backend
+                .send(Command::LocalFlacSeek(u64::from(position_ms)));
+            return;
+        }
         // Dragging the bar under the remembered song moves the point a press
         // of play will resume from; there is no stream to seek yet.
         if self.now_playing_live().is_none() && self.resume_track.is_some() {
@@ -11251,6 +11437,20 @@ impl App {
 
     fn set_volume(&mut self, percent: u8, settle: bool) {
         let percent = percent.min(100);
+        if self.local_flac.active {
+            self.local_flac.volume_percent = percent;
+            if percent > 0 && self.local_flac.muted {
+                self.local_flac.muted = false;
+                self.backend.send(Command::LocalFlacSetMuted(false));
+            }
+            self.backend.send(Command::LocalFlacSetVolume(percent));
+            let volume = percent_to_volume(percent);
+            if self.settings.volume != volume {
+                self.settings.volume = volume;
+                self.settings_dirty = true;
+            }
+            return;
+        }
         if self.has_soloist_output_volume() && self.targets_own_soloist() {
             self.backend.soloist_output_volume.set(percent);
             self.pending_remote_volume = None;
@@ -12088,6 +12288,17 @@ impl App {
         if let Some(folder) = folder {
             self.backend.send(Command::ScanLocalFiles(folder));
         }
+        // A blank library root is no root: the sync folder then follows the
+        // local files folder, as it does when none is set.
+        let custom_root = self
+            .settings
+            .sync
+            .library_root
+            .as_deref()
+            .is_some_and(|root| !root.trim().is_empty());
+        if !custom_root {
+            self.push_sync_config();
+        }
         self.actions.push(Action::RestartEngine);
     }
 
@@ -12553,6 +12764,7 @@ impl App {
             );
         if self.soloist_waiting()
             && !held
+            && !self.local_flac.active
             && matches!(
                 &action,
                 Action::PlayContext { .. }
@@ -12800,6 +13012,9 @@ impl App {
                 self.play_request(PlayRequest::context(uri), true);
             }
             Action::TogglePlay => self.toggle_play(),
+            Action::Next if self.local_flac.active => {
+                self.backend.send(Command::LocalFlacNext);
+            }
             Action::Next if self.resume_only() => {
                 self.step_resume(true);
             }
@@ -12815,6 +13030,9 @@ impl App {
                     Target::Local => self.backend.player(PlayerCommand::Next),
                     Target::Remote(device_id) => self.remote(RemoteAction::Next, device_id),
                 }
+            }
+            Action::Previous if self.local_flac.active => {
+                self.backend.send(Command::LocalFlacPrevious);
             }
             // Previous restarts after three seconds and otherwise steps back,
             // matching librespot.
@@ -12866,6 +13084,12 @@ impl App {
                 }
             }
             Action::ToggleMute => {
+                if self.local_flac.active {
+                    let muted = !self.local_flac.muted;
+                    self.local_flac.muted = muted;
+                    self.backend.send(Command::LocalFlacSetMuted(muted));
+                    return;
+                }
                 if !self.can_set_volume() {
                     return;
                 }
@@ -14237,6 +14461,214 @@ impl App {
                     );
                 }
             }
+            // Sync & local lossless playback
+            Action::TogglePlaylistSync {
+                playlist_id,
+                playlist_name,
+                enabled,
+            } => {
+                if let Some(entry) = self
+                    .settings
+                    .sync
+                    .synced_playlists
+                    .iter_mut()
+                    .find(|p| p.id == playlist_id)
+                {
+                    entry.name = playlist_name.clone();
+                    entry.enabled = enabled;
+                } else {
+                    self.settings.sync.synced_playlists.push(
+                        crate::settings::SyncedPlaylistSetting {
+                            id: playlist_id.clone(),
+                            name: playlist_name.clone(),
+                            enabled,
+                        },
+                    );
+                }
+                self.mark_settings_dirty();
+                // Update UI snapshot optimistically so the toggle never flickers.
+                if let Some(existing) = self
+                    .sync_state
+                    .playlists
+                    .iter_mut()
+                    .find(|p| p.playlist_id == playlist_id)
+                {
+                    existing.name = playlist_name.clone();
+                    existing.enabled = enabled;
+                } else {
+                    self.sync_state.playlists.push(spotisync::SyncedPlaylist {
+                        playlist_id: playlist_id.clone(),
+                        name: playlist_name.clone(),
+                        enabled,
+                        last_polled_at: None,
+                    });
+                }
+                self.backend.send(Command::SyncSetPlaylist {
+                    playlist_id,
+                    playlist_name,
+                    enabled,
+                });
+            }
+            Action::SyncTriggerNow => self.backend.send(Command::SyncTriggerNow),
+            Action::SyncRetryTrack {
+                playlist_id,
+                track_id,
+            } => {
+                if let Some(info) = self
+                    .sync_state
+                    .track_statuses
+                    .get_mut(&(playlist_id.clone(), track_id.clone()))
+                {
+                    info.status = spotisync::SyncStatus::Pending;
+                    info.error = None;
+                }
+                self.backend.send(Command::SyncRetryTrack {
+                    playlist_id,
+                    track_id,
+                });
+            }
+            Action::SyncOpenTrackFolder(path) => {
+                self.backend.send(Command::OpenTrackFolder(path));
+            }
+            Action::SyncChooseLibraryRoot => self.backend.choose_sync_library_root(),
+            Action::SyncClearLibraryRoot => {
+                self.settings.sync.library_root = None;
+                self.mark_settings_dirty();
+                self.push_sync_config();
+            }
+            Action::SyncSetQualityCeiling(ceiling) => {
+                if self.settings.sync.quality_ceiling != ceiling {
+                    self.settings.sync.quality_ceiling = ceiling;
+                    self.mark_settings_dirty();
+                    self.push_sync_config();
+                }
+            }
+            Action::SyncSetConcurrency(concurrency) => {
+                let clamped = concurrency.clamp(1, 8);
+                if self.settings.sync.concurrency != clamped {
+                    self.settings.sync.concurrency = clamped;
+                    self.mark_settings_dirty();
+                    self.push_sync_config();
+                }
+            }
+            Action::SyncSetProviderEnabled {
+                provider_id,
+                enabled,
+            } => {
+                if let Some(entry) = self
+                    .settings
+                    .sync
+                    .providers
+                    .iter_mut()
+                    .find(|p| p.id == provider_id)
+                {
+                    entry.enabled = enabled;
+                } else {
+                    self.settings
+                        .sync
+                        .providers
+                        .push(crate::settings::SyncProviderConfig {
+                            id: provider_id,
+                            enabled,
+                        });
+                }
+                self.mark_settings_dirty();
+                self.push_sync_config();
+            }
+            Action::SyncMoveProvider { provider_id, up } => {
+                if let Some(idx) = self
+                    .settings
+                    .sync
+                    .providers
+                    .iter()
+                    .position(|p| p.id == provider_id)
+                {
+                    let len = self.settings.sync.providers.len();
+                    let target = if up {
+                        idx.checked_sub(1)
+                    } else if idx + 1 < len {
+                        Some(idx + 1)
+                    } else {
+                        None
+                    };
+                    if let Some(target) = target {
+                        self.settings.sync.providers.swap(idx, target);
+                        self.mark_settings_dirty();
+                        self.push_sync_config();
+                    }
+                }
+            }
+            Action::SyncSaveQobuzCredentials {
+                app_id,
+                user_auth_token,
+                app_secret,
+            } => {
+                self.sync_state.qobuz_credentials =
+                    crate::sync_bridge::CredentialStatus::Validating;
+                self.sync_qobuz_app_id_input = app_id.trim().to_string();
+                self.sync_qobuz_token_input.clear();
+                self.sync_qobuz_secret_input.clear();
+                self.backend.send(Command::SyncSaveQobuzCredentials {
+                    app_id,
+                    user_auth_token,
+                    app_secret,
+                });
+            }
+            Action::SyncClearQobuzCredentials => {
+                self.sync_qobuz_app_id_input.clear();
+                self.sync_qobuz_token_input.clear();
+                self.sync_qobuz_secret_input.clear();
+                self.sync_state.qobuz_credentials = crate::sync_bridge::CredentialStatus::Missing;
+                self.sync_state.qobuz_app_id_hint = None;
+                self.backend.send(Command::SyncClearQobuzCredentials);
+            }
+            Action::SyncValidateQobuzCredentials => {
+                self.sync_state.qobuz_credentials =
+                    crate::sync_bridge::CredentialStatus::Validating;
+                self.backend.send(Command::SyncValidateQobuzCredentials);
+            }
+            Action::PlaySyncedTrack { path, queue, index } => {
+                let track = queue.get(index).cloned().unwrap_or_else(|| {
+                    let title = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("Local FLAC")
+                        .to_string();
+                    crate::local_player::LocalFlacTrack {
+                        path: path.clone(),
+                        title,
+                        ..Default::default()
+                    }
+                });
+                // Whatever starts now outranks a play-search still in flight,
+                // and a play held for the engine must not replay over it.
+                self.supersede_play_search();
+                self.queued_play = None;
+                self.played_row = None;
+                self.intent_track = None;
+                self.resume_load = None;
+                self.local_flac.active = true;
+                self.local_flac.playback = Playback::Loading;
+                self.local_flac.track = Some(track.clone());
+                self.backend.send(Command::PlaySyncedTrack {
+                    track: Box::new(track),
+                    queue,
+                    index,
+                });
+                self.request_lyrics_for_local_track();
+            }
+            Action::LocalFlacPlayPause => self.backend.send(Command::LocalFlacPlayPause),
+            Action::LocalFlacNext => self.backend.send(Command::LocalFlacNext),
+            Action::LocalFlacPrevious => self.backend.send(Command::LocalFlacPrevious),
+            Action::LocalFlacSeek(position_ms) => {
+                self.local_flac.position_ms = position_ms;
+                self.backend.send(Command::LocalFlacSeek(position_ms));
+            }
+            Action::LocalFlacStop => {
+                self.local_flac.active = false;
+                self.local_flac.playback = Playback::Stopped;
+                self.backend.send(Command::LocalFlacStop);
+            }
             Action::Quit => {
                 self.quit_requested = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -14698,7 +15130,15 @@ impl App {
             self.reachable = conditions.online;
             self.backend.network_status(conditions.online);
         }
-        if crate::power::playback_needs_activity(&self.local) {
+        // Local FLAC playback holds the same activity and keep-awake as the
+        // librespot player, which it replaces while it plays.
+        let local_flac_playing = self.local_flac.active
+            && self.local_flac.error.is_none()
+            && matches!(
+                self.local_flac.playback,
+                Playback::Playing | Playback::Loading
+            );
+        if crate::power::playback_needs_activity(&self.local) || local_flac_playing {
             self.playback_activity
                 .get_or_insert_with(|| crate::power::Activity::begin("Spotify playback"));
             let power = &self.power;
@@ -36913,5 +37353,178 @@ mod tests {
         let server_err =
             widgets::sanitize_error_message("500 Internal Server Error", Locale::English);
         assert_eq!(server_err.as_ref(), "500 Internal Server Error");
+    }
+
+    #[test]
+    fn sync_actions_and_local_flac_transport_update_app_state() {
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+
+        // Sync settings actions update settings and optimistic sync state.
+        app.apply(
+            Action::TogglePlaylistSync {
+                playlist_id: "pl_sync".into(),
+                playlist_name: "Lossless Favorites".into(),
+                enabled: true,
+            },
+            &ctx,
+        );
+        assert!(app.sync_state.is_playlist_enabled("pl_sync"));
+        assert_eq!(app.settings.sync.synced_playlists.len(), 1);
+
+        app.apply(
+            Action::SyncSetQualityCeiling(crate::settings::SyncQualityCeiling::Flac24_96),
+            &ctx,
+        );
+        assert_eq!(
+            app.settings.sync.quality_ceiling,
+            crate::settings::SyncQualityCeiling::Flac24_96
+        );
+
+        app.apply(Action::SyncSetConcurrency(12), &ctx);
+        assert_eq!(app.settings.sync.concurrency, 8);
+
+        app.apply(
+            Action::SyncSetProviderEnabled {
+                provider_id: "tidal".into(),
+                enabled: false,
+            },
+            &ctx,
+        );
+        app.apply(
+            Action::SyncMoveProvider {
+                provider_id: "tidal".into(),
+                up: true,
+            },
+            &ctx,
+        );
+        assert_eq!(app.settings.sync.providers[0].id, "tidal");
+
+        // Submitting Qobuz credentials clears secret input buffers immediately.
+        app.sync_qobuz_app_id_input = "app-123".into();
+        app.sync_qobuz_token_input = "secret-token".into();
+        app.sync_qobuz_secret_input = "secret-key".into();
+        app.apply(
+            Action::SyncSaveQobuzCredentials {
+                app_id: "app-123".into(),
+                user_auth_token: "secret-token".into(),
+                app_secret: Some("secret-key".into()),
+            },
+            &ctx,
+        );
+        assert_eq!(app.sync_qobuz_app_id_input, "app-123");
+        assert!(app.sync_qobuz_token_input.is_empty());
+        assert!(app.sync_qobuz_secret_input.is_empty());
+        assert_eq!(
+            app.sync_state.qobuz_credentials,
+            crate::sync_bridge::CredentialStatus::Validating
+        );
+
+        // Local FLAC playback projects into now_playing and receives transport controls.
+        let flac_track = crate::local_player::LocalFlacTrack {
+            path: std::path::PathBuf::from("/music/instant_crush.flac"),
+            title: "Instant Crush".into(),
+            artists: vec!["Daft Punk".into()],
+            album: "Random Access Memories".into(),
+            duration_ms: 337_000,
+            playlist_id: Some("pl_sync".into()),
+            track_id: Some("tr1".into()),
+            quality_label: Some("24-bit / 96 kHz FLAC".into()),
+            sample_rate_hz: Some(96_000),
+            bit_depth: Some(24),
+        };
+        app.handle_backend_events(vec![Event::LocalFlacState(
+            crate::local_player::LocalFlacState {
+                active: true,
+                playback: Playback::Playing,
+                track: Some(flac_track.clone()),
+                position_ms: 12_000,
+                duration_ms: 337_000,
+                volume_percent: 80,
+                muted: false,
+                error: None,
+                queue: vec![flac_track],
+                queue_index: 0,
+            },
+        )]);
+
+        let now = app.now_playing().expect("local FLAC should be now playing");
+        assert_eq!(now.title, "Instant Crush");
+        assert_eq!(now.device_name.as_deref(), Some("24-bit / 96 kHz FLAC"));
+        assert!(now.playing);
+        assert_eq!(now.volume_percent, 80);
+
+        app.apply(Action::Seek(45_000), &ctx);
+        assert_eq!(app.local_flac.position_ms, 45_000);
+
+        app.apply(Action::ToggleMute, &ctx);
+        assert!(app.local_flac.muted);
+        assert_eq!(app.now_playing().unwrap().volume_percent, 0);
+
+        app.apply(Action::SetVolume(65), &ctx);
+        assert!(!app.local_flac.muted);
+        assert_eq!(app.local_flac.volume_percent, 65);
+    }
+
+    /// Local FLAC playback holds the keep-awake and App Nap activity while it
+    /// plays, and lets both go once it pauses.
+    #[test]
+    fn local_flac_playback_holds_the_keep_awake_too() {
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+        app.local_flac.active = true;
+        app.local_flac.playback = Playback::Playing;
+        app.sync_power(&ctx);
+        assert!(app.keep_awake.is_some());
+        assert!(app.playback_activity.is_some());
+        app.local_flac.playback = Playback::Paused;
+        app.sync_power(&ctx);
+        assert!(app.keep_awake.is_none(), "a paused FLAC song may sleep");
+        assert!(app.playback_activity.is_none());
+    }
+
+    /// A local song that starts outranks a play-search still in flight and a
+    /// Spotify play held for the engine, which must not replay over it.
+    #[test]
+    fn a_synced_track_start_supersedes_a_held_play_and_a_search() {
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+        app.queued_play = Some(PlayRequest::tracks(vec!["spotify:track:held".into()]));
+        let serial = app.play_search_serial;
+        app.apply(
+            Action::PlaySyncedTrack {
+                path: std::path::PathBuf::from("/music/instant_crush.flac"),
+                queue: Vec::new(),
+                index: 0,
+            },
+            &ctx,
+        );
+        assert!(app.queued_play.is_none());
+        assert_ne!(app.play_search_serial, serial);
+        app.backend.shutdown();
+    }
+
+    /// Lyrics on screen follow a local song that starts.
+    #[test]
+    fn a_local_song_starting_requests_the_lyrics_on_screen() {
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+        app.show_lyrics_panel = true;
+        let track = crate::local_player::LocalFlacTrack {
+            path: std::path::PathBuf::from("/music/instant_crush.flac"),
+            title: "Instant Crush".into(),
+            track_id: Some("tr1".into()),
+            ..Default::default()
+        };
+        app.apply(
+            Action::PlaySyncedTrack {
+                path: track.path.clone(),
+                queue: vec![track],
+                index: 0,
+            },
+            &ctx,
+        );
+        assert_eq!(app.lyrics_uri.as_deref(), Some("spotify:track:tr1"));
+        app.backend.shutdown();
     }
 }

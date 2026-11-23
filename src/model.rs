@@ -126,6 +126,8 @@ pub enum Page {
     /// seed's URI.
     Radio(String),
     Queue,
+    SyncedLibrary,
+    SyncQueue,
     Settings,
 }
 
@@ -147,6 +149,8 @@ impl Page {
             Page::Show(id) => format!("show:{id}"),
             Page::Radio(seed) => format!("radio:{seed}"),
             Page::Queue => "queue".into(),
+            Page::SyncedLibrary => "synced_library".into(),
+            Page::SyncQueue => "sync_queue".into(),
             Page::Settings => "settings".into(),
         }
     }
@@ -163,6 +167,8 @@ impl Page {
             "podcasts" => Page::Podcasts,
             "episodes" => Page::Episodes,
             "queue" => Page::Queue,
+            "synced_library" => Page::SyncedLibrary,
+            "sync_queue" => Page::SyncQueue,
             "settings" => Page::Settings,
             other => {
                 let (kind, id) = other.split_once(':')?;
@@ -199,6 +205,7 @@ pub enum QueueTab {
     #[default]
     Queue,
     Recents,
+    Sync,
 }
 
 impl QueueTab {
@@ -206,6 +213,7 @@ impl QueueTab {
         match self {
             Self::Queue => "queue",
             Self::Recents => "recents",
+            Self::Sync => "sync",
         }
     }
 
@@ -213,6 +221,7 @@ impl QueueTab {
         match text {
             "queue" => Some(Self::Queue),
             "recents" => Some(Self::Recents),
+            "sync" => Some(Self::Sync),
             // Backward compatibility with the old tab name.
             "recently_played" => Some(Self::Recents),
             _ => None,
@@ -1507,6 +1516,47 @@ pub enum Action {
     /// Fetch one of projectM's preset packs into the folder, by its place
     /// in the list.
     DownloadMilkdropPack(usize),
+    // Sync & local lossless playback
+    TogglePlaylistSync {
+        playlist_id: String,
+        playlist_name: String,
+        enabled: bool,
+    },
+    SyncTriggerNow,
+    SyncRetryTrack {
+        playlist_id: String,
+        track_id: String,
+    },
+    SyncOpenTrackFolder(std::path::PathBuf),
+    SyncChooseLibraryRoot,
+    SyncClearLibraryRoot,
+    SyncSetQualityCeiling(crate::settings::SyncQualityCeiling),
+    SyncSetConcurrency(u8),
+    SyncSetProviderEnabled {
+        provider_id: String,
+        enabled: bool,
+    },
+    SyncMoveProvider {
+        provider_id: String,
+        up: bool,
+    },
+    SyncSaveQobuzCredentials {
+        app_id: String,
+        user_auth_token: String,
+        app_secret: Option<String>,
+    },
+    SyncClearQobuzCredentials,
+    SyncValidateQobuzCredentials,
+    PlaySyncedTrack {
+        path: std::path::PathBuf,
+        queue: Vec<crate::local_player::LocalFlacTrack>,
+        index: usize,
+    },
+    LocalFlacPlayPause,
+    LocalFlacNext,
+    LocalFlacPrevious,
+    LocalFlacSeek(u64),
+    LocalFlacStop,
     Quit,
 }
 

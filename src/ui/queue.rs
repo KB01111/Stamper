@@ -78,6 +78,7 @@ pub fn side_panel(app: &mut App, ui: &mut egui::Ui) {
                     &[
                         (QueueTab::Queue, &gettext(app.locale, "Queue")),
                         (QueueTab::Recents, &gettext(app.locale, "Recent")),
+                        (QueueTab::Sync, &gettext(app.locale, "Sync")),
                     ],
                     tab,
                 );
@@ -130,6 +131,7 @@ pub fn side_panel(app: &mut App, ui: &mut egui::Ui) {
             |ui| match app.queue_tab {
                 QueueTab::Queue => contents(app, ui, true),
                 QueueTab::Recents => recents_contents(app, ui),
+                QueueTab::Sync => super::sync::queue_panel(app, ui),
             },
         );
     });
@@ -227,6 +229,7 @@ pub fn fullscreen_column(app: &mut App, ui: &mut egui::Ui) {
                 &[
                     (QueueTab::Queue, &gettext(app.locale, "Queue")),
                     (QueueTab::Recents, &gettext(app.locale, "Recent")),
+                    (QueueTab::Sync, &gettext(app.locale, "Sync")),
                 ],
                 tab,
             );
@@ -279,6 +282,7 @@ pub fn fullscreen_column(app: &mut App, ui: &mut egui::Ui) {
         |ui| match app.queue_tab {
             QueueTab::Queue => contents(app, ui, true),
             QueueTab::Recents => recents_contents(app, ui),
+            QueueTab::Sync => super::sync::queue_panel(app, ui),
         },
     );
 }

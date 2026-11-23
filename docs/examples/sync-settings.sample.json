@@ -1,0 +1,21 @@
+{
+  "sync": {
+    "library_root": null,
+    "providers": [
+      {
+        "id": "qobuz",
+        "enabled": true
+      }
+    ],
+    "quality_ceiling": "flac24_192",
+    "concurrency": 2,
+    "poll_interval_secs": 60,
+    "synced_playlists": [
+      {
+        "id": "37i9dQZF1DXcBWIGoYBM5M",
+        "name": "Example Playlist",
+        "enabled": true
+      }
+    ]
+  }
+}
