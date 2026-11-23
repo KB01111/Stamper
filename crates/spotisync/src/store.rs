@@ -169,6 +169,32 @@ impl SyncStore {
         Self::init_connection(conn)
     }
 
+    /// Folds the committed rows of the write-ahead log into the main file at
+    /// `path`, so the main file alone holds them. A file that does not exist
+    /// has nothing to fold. Fails with [`SyncError::Store`] when another
+    /// connection keeps the log busy, in which case the main file may lag.
+    pub fn checkpoint(path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        if !path.is_file() {
+            return Ok(());
+        }
+        let conn = Connection::open(path).map_err(store_err)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(store_err)?;
+        // Columns: busy flag, frames in the log, frames folded in.
+        let (busy, _, _): (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(store_err)?;
+        if busy != 0 {
+            return Err(SyncError::Store(
+                "sync database is busy; its log was not folded in".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn init_connection(conn: Connection) -> Result<Self> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -900,5 +926,42 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// A copy of the main file alone misses rows still in the write-ahead
+    /// log; after a checkpoint it holds them.
+    #[test]
+    fn checkpoint_puts_committed_rows_into_the_main_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("sync.db");
+        let copy = dir.path().join("copy.db");
+        let store = SyncStore::open(&db).expect("open");
+        store
+            .set_playlist_enabled("pl1", "Favorites", true)
+            .expect("enable");
+
+        std::fs::copy(&db, &copy).expect("copy before checkpoint");
+        let early = SyncStore::open(&copy).expect("open early copy");
+        assert!(
+            early.list_synced_playlists().expect("list").is_empty(),
+            "the row is still only in the log"
+        );
+        drop(early);
+        std::fs::remove_file(&copy).expect("remove early copy");
+
+        SyncStore::checkpoint(&db).expect("checkpoint");
+        std::fs::copy(&db, &copy).expect("copy after checkpoint");
+        let late = SyncStore::open(&copy).expect("open late copy");
+        let playlists = late.list_synced_playlists().expect("list");
+        assert_eq!(playlists.len(), 1);
+        assert_eq!(playlists[0].playlist_id, "pl1");
+        drop(store);
+    }
+
+    #[test]
+    fn checkpoint_of_a_missing_file_does_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        SyncStore::checkpoint(dir.path().join("absent.db")).expect("nothing to fold");
+        assert!(!dir.path().join("absent.db").exists());
     }
 }

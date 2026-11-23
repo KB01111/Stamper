@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -24,7 +24,7 @@ use crate::api::models::{PlayableItem, Track, pick_image};
 use crate::api::{ApiError, ApiGateway, Operation};
 use crate::credentials::{QobuzGrant, Store as CredentialStore};
 use crate::paths::AppDirs;
-use crate::settings::SyncSettings;
+use crate::settings::{SyncSettings, SyncedPlaylistSetting};
 
 /// Page size used when fetching playlist tracks for sync diffing.
 const PLAYLIST_SYNC_PAGE_SIZE: u32 = 50;
@@ -37,6 +37,13 @@ const SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// Refresh interval while any provider rate-limit cooldown countdown is active.
 const COOLDOWN_TICK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How often the coordinator checks whether the signed-in account changed.
+const ACCOUNT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long a worker may take to finish its current step once a stop is
+/// requested, before it is aborted.
+const WORKER_STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// Callback invoked whenever [`SyncUiState`] updates.
 pub type SyncStateHook = Arc<dyn Fn(SyncUiState) + Send + Sync>;
@@ -145,6 +152,12 @@ impl SpotifyPlaylistSource {
 }
 
 impl PlaylistSource for SpotifyPlaylistSource {
+    fn account_key(&self) -> Option<String> {
+        self.api
+            .account()
+            .map(|account| account.as_str().to_string())
+    }
+
     fn fetch_playlist_tracks<'life0, 'life1, 'async_trait>(
         &'life0 self,
         playlist_id: &'life1 str,
@@ -169,12 +182,14 @@ impl PlaylistSource for SpotifyPlaylistSource {
 
             let mut tracks = Vec::new();
             let mut offset = 0u32;
+            let mut pages_read = 0usize;
 
-            for _ in 0..MAX_PLAYLIST_SYNC_PAGES {
+            loop {
                 let page = client
                     .playlist_items(playlist_id, offset, PLAYLIST_SYNC_PAGE_SIZE)
                     .await
                     .map_err(map_api_error)?;
+                pages_read += 1;
 
                 for item in &page.items {
                     if item.is_local {
@@ -187,18 +202,43 @@ impl PlaylistSource for SpotifyPlaylistSource {
                     }
                 }
 
-                let Some(next) = page.next_offset() else {
-                    break;
-                };
-                if next <= offset {
-                    break;
+                match next_page_offset(offset, pages_read, page.next_offset())? {
+                    Some(next) => offset = next,
+                    None => return Ok(tracks),
                 }
-                offset = next;
             }
-
-            Ok(tracks)
         })
     }
+}
+
+/// Decides whether a playlist read goes on. The list is complete only when
+/// the server runs out of pages. A page cap reached first, or an offset that
+/// stops advancing, is an error: a partial list must never be taken as the
+/// whole playlist.
+fn next_page_offset(
+    offset: u32,
+    pages_read: usize,
+    next: Option<u32>,
+) -> spotisync::Result<Option<u32>> {
+    let Some(next) = next else {
+        return Ok(None);
+    };
+    if next <= offset {
+        return Err(SyncError::Provider {
+            provider: "spotify".into(),
+            message: "playlist paging stopped advancing; the playlist was not read in full".into(),
+        });
+    }
+    if pages_read >= MAX_PLAYLIST_SYNC_PAGES {
+        return Err(SyncError::Provider {
+            provider: "spotify".into(),
+            message: format!(
+                "playlist has more than {} tracks; it was not read in full",
+                MAX_PLAYLIST_SYNC_PAGES * PLAYLIST_SYNC_PAGE_SIZE as usize
+            ),
+        });
+    }
+    Ok(Some(next))
 }
 
 fn map_api_error(error: ApiError) -> SyncError {
@@ -318,6 +358,8 @@ enum SyncCmd {
     ValidateQobuzCredentials,
     QobuzValidated {
         generation: u64,
+        /// The credentials being saved, or `None` when re-checking saved ones.
+        candidate: Option<QobuzGrant>,
         result: std::result::Result<(), String>,
     },
     Shutdown,
@@ -341,6 +383,7 @@ impl SyncController {
     ) -> Self {
         Self::start_inner(
             dirs.sync_db_file(),
+            dirs.sync_owner_file(),
             credentials,
             source,
             initial_settings,
@@ -353,6 +396,7 @@ impl SyncController {
     #[allow(clippy::too_many_arguments)]
     fn start_inner(
         db_path: PathBuf,
+        owner_file: PathBuf,
         credentials: CredentialStore,
         source: Arc<dyn PlaylistSource>,
         initial_settings: SyncSettings,
@@ -365,6 +409,7 @@ impl SyncController {
         tokio::spawn(async move {
             let mut actor = SyncActor {
                 db_path,
+                owner_file,
                 credentials,
                 source,
                 settings: initial_settings,
@@ -372,6 +417,7 @@ impl SyncController {
                 on_state,
                 internal_tx,
                 qobuz_base_config,
+                account: None,
                 store: None,
                 queue: None,
                 watcher: None,
@@ -440,6 +486,7 @@ impl SyncController {
 
 struct SyncActor {
     db_path: PathBuf,
+    owner_file: PathBuf,
     credentials: CredentialStore,
     source: Arc<dyn PlaylistSource>,
     settings: SyncSettings,
@@ -447,6 +494,8 @@ struct SyncActor {
     on_state: SyncStateHook,
     internal_tx: mpsc::UnboundedSender<SyncCmd>,
     qobuz_base_config: QobuzConfig,
+    /// The account the sync state is attached to, if any.
+    account: Option<String>,
     store: Option<SyncStore>,
     queue: Option<SyncQueue>,
     watcher: Option<PlaylistWatcher>,
@@ -461,52 +510,12 @@ struct SyncActor {
 
 impl SyncActor {
     async fn run(&mut self, mut rx: mpsc::UnboundedReceiver<SyncCmd>) {
-        // 1. Open SQLite store and recover any interrupted rows off the UI thread.
-        let db_path = self.db_path.clone();
-        let opened = tokio::task::spawn_blocking(move || {
-            let store = SyncStore::open(&db_path)?;
-            let _ = store.recover_interrupted()?;
-            Ok::<SyncStore, SyncError>(store)
-        })
-        .await;
-
-        let store = match opened {
-            Ok(Ok(store)) => store,
-            Ok(Err(err)) => {
-                log::error!("unable to open sync database: {err}");
-                self.last_error = Some(format!("Unable to open sync database: {err}"));
-                self.emit_now().await;
-                return;
-            }
-            Err(join_err) => {
-                log::error!("sync database initialization panicked: {join_err}");
-                self.last_error = Some("Unable to initialize sync database.".into());
-                self.emit_now().await;
-                return;
-            }
-        };
-
-        // 2. Seed playlists from settings.
-        let seed_playlists = self.settings.synced_playlists.clone();
-        if !seed_playlists.is_empty() {
-            let seed_store = store.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                for pl in seed_playlists {
-                    if !pl.id.trim().is_empty() {
-                        let _ = seed_store.set_playlist_enabled(&pl.id, &pl.name, pl.enabled);
-                    }
-                }
-            })
-            .await;
-        }
-        self.store = Some(store);
-
-        // 3. Load saved Qobuz credentials from the protected store (never logged).
+        // 1. Load saved Qobuz credentials from the protected store (never logged).
         match self.credentials.load_qobuz().await {
             Ok(Some(grant)) if grant.valid() => {
                 self.qobuz_grant = Some(grant.clone());
                 self.qobuz_status = CredentialStatus::Validating;
-                self.spawn_qobuz_validation(grant);
+                self.spawn_qobuz_validation(grant, false);
             }
             Ok(_) => {
                 self.qobuz_grant = None;
@@ -522,15 +531,18 @@ impl SyncActor {
             }
         }
 
-        // 4. Start SyncQueue + PlaylistWatcher workers and emit initial snapshot.
-        self.rebuild_workers().await;
+        // 2. Attach the sync state to the signed-in account, start the workers, and emit.
+        self.attach_account().await;
         self.emit_now().await;
 
-        // 5. Event loop with debounced background snapshot updates and cooldown ticks.
+        // 3. Event loop with debounced background snapshot updates, cooldown ticks,
+        // and account checks.
         let mut dirty_emit = false;
         let mut last_emit = Instant::now();
         let mut cooldown_tick = tokio::time::interval(COOLDOWN_TICK_INTERVAL);
         cooldown_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut account_check = tokio::time::interval(ACCOUNT_CHECK_INTERVAL);
+        account_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             let debounce_sleep = async {
@@ -588,6 +600,14 @@ impl SyncActor {
                     dirty_emit = false;
                     self.emit_now().await;
                     last_emit = Instant::now();
+                }
+                _ = account_check.tick() => {
+                    if self.source.account_key() != self.account {
+                        self.attach_account().await;
+                        dirty_emit = false;
+                        self.emit_now().await;
+                        last_emit = Instant::now();
+                    }
                 }
             }
         }
@@ -685,20 +705,9 @@ impl SyncActor {
                     };
                     return;
                 }
-                if let Err(err) = self.credentials.save_qobuz(grant.clone()).await {
-                    log::warn!("unable to save Qobuz credentials: {err}");
-                    self.last_error = Some(err.to_string());
-                    self.qobuz_status = CredentialStatus::Invalid {
-                        provider: "qobuz".into(),
-                        message: err.to_string(),
-                    };
-                    return;
-                }
-                self.last_error = None;
-                self.qobuz_grant = Some(grant.clone());
+                // Nothing is saved or used until the provider accepts them.
                 self.qobuz_status = CredentialStatus::Validating;
-                self.rebuild_workers().await;
-                self.spawn_qobuz_validation(grant);
+                self.spawn_qobuz_validation(grant, true);
             }
             SyncCmd::ClearQobuzCredentials => {
                 self.validation_gen = self.validation_gen.wrapping_add(1);
@@ -715,18 +724,50 @@ impl SyncActor {
             SyncCmd::ValidateQobuzCredentials => match self.qobuz_grant.clone() {
                 Some(grant) if grant.valid() => {
                     self.qobuz_status = CredentialStatus::Validating;
-                    self.spawn_qobuz_validation(grant);
+                    self.spawn_qobuz_validation(grant, false);
                 }
                 _ => {
                     self.qobuz_status = CredentialStatus::Missing;
                 }
             },
-            SyncCmd::QobuzValidated { generation, result } => {
+            SyncCmd::QobuzValidated {
+                generation,
+                candidate,
+                result,
+            } => {
                 if generation != self.validation_gen {
                     return;
                 }
-                match result {
-                    Ok(()) => {
+                match (candidate, result) {
+                    (Some(grant), Ok(())) => {
+                        // Accepted: save it, then use it. A failed save keeps
+                        // the previous credentials in place.
+                        if let Err(err) = self.credentials.save_qobuz(grant.clone()).await {
+                            log::warn!("unable to save Qobuz credentials: {err}");
+                            self.last_error = Some(err.to_string());
+                            self.qobuz_status = CredentialStatus::Invalid {
+                                provider: "qobuz".into(),
+                                message: err.to_string(),
+                            };
+                            return;
+                        }
+                        self.qobuz_grant = Some(grant);
+                        self.last_error = None;
+                        self.qobuz_status = CredentialStatus::Valid {
+                            provider: "qobuz".into(),
+                            detail: "Connected".into(),
+                        };
+                        self.rebuild_workers().await;
+                    }
+                    (Some(_), Err(message)) => {
+                        // Rejected: the saved credentials stay, and only the
+                        // rejection is reported. The message carries no secret.
+                        self.qobuz_status = CredentialStatus::Invalid {
+                            provider: "qobuz".into(),
+                            message: format!("New Qobuz credentials were not saved: {message}"),
+                        };
+                    }
+                    (None, Ok(())) => {
                         self.qobuz_status = CredentialStatus::Valid {
                             provider: "qobuz".into(),
                             detail: "Connected".into(),
@@ -736,7 +777,7 @@ impl SyncActor {
                             queue.wake();
                         }
                     }
-                    Err(message) => {
+                    (None, Err(message)) => {
                         self.qobuz_status = CredentialStatus::Invalid {
                             provider: "qobuz".into(),
                             message,
@@ -748,12 +789,15 @@ impl SyncActor {
         }
     }
 
-    fn spawn_qobuz_validation(&mut self, grant: QobuzGrant) {
+    /// Checks `grant` with the provider. `candidate` marks new credentials
+    /// the user typed: they are saved only if the check passes.
+    fn spawn_qobuz_validation(&mut self, grant: QobuzGrant, candidate: bool) {
         self.validation_gen = self.validation_gen.wrapping_add(1);
         let generation = self.validation_gen;
         let tx = self.internal_tx.clone();
         let mut config = self.qobuz_base_config.clone();
         config.max_quality = self.settings.quality_ceiling.to_spotisync();
+        let candidate = candidate.then(|| grant.clone());
 
         tokio::spawn(async move {
             let creds =
@@ -765,7 +809,11 @@ impl SyncActor {
                     .map_err(|err| err.to_string()),
                 Err(err) => Err(err.to_string()),
             };
-            let _ = tx.send(SyncCmd::QobuzValidated { generation, result });
+            let _ = tx.send(SyncCmd::QobuzValidated {
+                generation,
+                candidate,
+                result,
+            });
         });
     }
 
@@ -799,16 +847,45 @@ impl SyncActor {
     }
 
     async fn stop_workers(&mut self) {
-        if let Some(shutdown) = self.worker_shutdown.take() {
-            let _ = shutdown.send(true);
-        }
-        for handle in self.worker_tasks.drain(..) {
-            handle.abort();
-            let _ = handle.await;
-        }
+        let shutdown = self.worker_shutdown.take();
+        let tasks = std::mem::take(&mut self.worker_tasks);
+        stop_tasks(shutdown, tasks, WORKER_STOP_GRACE).await;
         self.queue = None;
         self.watcher = None;
         self.snapshot_rx = None;
+    }
+
+    /// Points the coordinator at the signed-in account's sync state. State
+    /// kept for another account is cleared when this account opens it. With no
+    /// account, nothing is shown or synced until one signs in.
+    async fn attach_account(&mut self) {
+        self.stop_workers().await;
+        self.store = None;
+        let key = self.source.account_key();
+        // Recorded before opening, so a failed open is not retried on every check.
+        self.account = key.clone();
+        self.last_error = None;
+        if let Some(account) = key {
+            let db_path = self.db_path.clone();
+            let owner_file = self.owner_file.clone();
+            let seed = self.settings.synced_playlists.clone();
+            let opened = tokio::task::spawn_blocking(move || {
+                open_for_account(&db_path, &owner_file, &account, &seed)
+            })
+            .await;
+            match opened {
+                Ok(Ok(store)) => self.store = Some(store),
+                Ok(Err(err)) => {
+                    log::error!("unable to open sync database: {err}");
+                    self.last_error = Some(format!("Unable to open sync database: {err}"));
+                }
+                Err(join_err) => {
+                    log::error!("sync database initialization panicked: {join_err}");
+                    self.last_error = Some("Unable to initialize sync database.".into());
+                }
+            }
+        }
+        self.rebuild_workers().await;
     }
 
     async fn rebuild_workers(&mut self) {
@@ -822,7 +899,10 @@ impl SyncActor {
             output_dir: self.resolved_root.clone(),
             per_provider_concurrency: usize::from(self.settings.clamped_concurrency()),
             match_config: MatchConfig {
-                max_quality: self.settings.quality_ceiling.to_spotisync(),
+                max_quality: matcher_quality_ceiling(
+                    self.settings.quality_ceiling.to_spotisync(),
+                    &providers,
+                ),
                 ..MatchConfig::default()
             },
             ..QueueConfig::default()
@@ -1012,6 +1092,102 @@ fn project_ui_state(
     })
 }
 
+/// Asks the workers to stop, then waits up to `grace` for each one to finish
+/// its current step. Aborting at once would drop a pass at its await point
+/// while the blocking work it started keeps running. A worker still busy
+/// after the grace period is aborted.
+async fn stop_tasks(
+    shutdown: Option<watch::Sender<bool>>,
+    tasks: Vec<JoinHandle<()>>,
+    grace: Duration,
+) {
+    if let Some(shutdown) = shutdown {
+        let _ = shutdown.send(true);
+    }
+    for mut task in tasks {
+        if tokio::time::timeout(grace, &mut task).await.is_err() {
+            log::warn!("sync worker did not stop within {grace:?}; aborting it");
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+/// The matcher's quality ceiling: the user's choice, lowered to what each
+/// provider can serve. The matcher cannot see provider caps itself.
+fn matcher_quality_ceiling(user_ceiling: Quality, providers: &[Arc<dyn Provider>]) -> Quality {
+    providers.iter().fold(user_ceiling, |ceiling, provider| {
+        ceiling.min(provider.max_quality())
+    })
+}
+
+/// Opens the sync database for `account`. Its state is kept only for the
+/// account that made it. State left by another account is removed first,
+/// because its playlists and tracks belong to that account. State from before
+/// the owner file existed is kept for the account that opens it first.
+fn open_for_account(
+    db_path: &Path,
+    owner_file: &Path,
+    account: &str,
+    seed: &[SyncedPlaylistSetting],
+) -> spotisync::Result<SyncStore> {
+    let owner = read_owner(owner_file);
+    let kept = match owner.as_deref() {
+        Some(owner) if owner != account => {
+            remove_sync_files(db_path)?;
+            false
+        }
+        _ => true,
+    };
+    if owner.as_deref() != Some(account) {
+        write_owner(owner_file, account)?;
+    }
+    let store = SyncStore::open(db_path)?;
+    let _ = store.recover_interrupted()?;
+    // Playlists enabled in settings belong to whichever account enabled them.
+    if kept {
+        for pl in seed {
+            if !pl.id.trim().is_empty() {
+                let _ = store.set_playlist_enabled(&pl.id, &pl.name, pl.enabled);
+            }
+        }
+    }
+    Ok(store)
+}
+
+fn read_owner(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value.get("account")?.as_str().map(str::to_string)
+}
+
+fn write_owner(path: &Path, account: &str) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(&serde_json::json!({ "account": account }))
+        .map_err(std::io::Error::other)?;
+    fastframe_file::write(path, bytes)
+}
+
+/// Removes the database and its write-ahead log files, if they exist.
+fn remove_sync_files(db_path: &Path) -> std::io::Result<()> {
+    let with_suffix = |suffix: &str| {
+        let mut name = db_path.as_os_str().to_owned();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    for path in [
+        db_path.to_path_buf(),
+        with_suffix("-wal"),
+        with_suffix("-shm"),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
 fn now_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1028,12 +1204,14 @@ mod tests {
 
     struct FakeSource {
         tracks: Mutex<HashMap<String, Vec<PlaylistTrack>>>,
+        account: Mutex<Option<String>>,
     }
 
     impl FakeSource {
         fn new() -> Self {
             Self {
                 tracks: Mutex::new(HashMap::new()),
+                account: Mutex::new(Some("account-a".to_string())),
             }
         }
 
@@ -1042,6 +1220,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(playlist_id.to_string(), items);
+        }
+
+        fn set_account(&self, account: Option<&str>) {
+            *self.account.lock().unwrap() = account.map(str::to_string);
         }
     }
 
@@ -1066,6 +1248,21 @@ mod tests {
                 .unwrap_or_default();
             Box::pin(async move { Ok(items) })
         }
+
+        fn account_key(&self) -> Option<String> {
+            self.account.lock().unwrap().clone()
+        }
+    }
+
+    /// Waits until the coordinator publishes a state that satisfies `ready`.
+    async fn wait_for_state(
+        rx: &mut watch::Receiver<SyncUiState>,
+        ready: impl Fn(&SyncUiState) -> bool,
+    ) {
+        tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|state| ready(state)))
+            .await
+            .expect("sync state did not reach the expected value")
+            .expect("sync state channel closed");
     }
 
     async fn spawn_mock_qobuz_server() -> (String, JoinHandle<()>) {
@@ -1099,7 +1296,14 @@ mod tests {
 
                     let (status, content_type, body): (&str, &str, Vec<u8>) =
                         if path.starts_with("/favorite/getUserFavorites") {
-                            ("200 OK", "application/json", b"{}".to_vec())
+                            if req
+                                .to_ascii_lowercase()
+                                .contains("x-user-auth-token: bad-token")
+                            {
+                                ("401 Unauthorized", "application/json", b"{}".to_vec())
+                            } else {
+                                ("200 OK", "application/json", b"{}".to_vec())
+                            }
                         } else if path.starts_with("/track/search") {
                             let body = serde_json::json!({
                                 "tracks": {
@@ -1265,6 +1469,7 @@ mod tests {
         let root = dirs.state.join("sync");
         let controller = SyncController::start_inner(
             dirs.sync_db_file(),
+            dirs.sync_owner_file(),
             creds,
             source,
             SyncSettings::default(),
@@ -1274,6 +1479,17 @@ mod tests {
         );
 
         controller.save_qobuz_credentials("123456".into(), "valid-token".into(), None);
+        // Credentials are used only once accepted, so the playlist follows them.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(
+                latest.lock().unwrap().qobuz_credentials,
+                CredentialStatus::Valid { .. }
+            ) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("credentials should be accepted");
         controller.set_playlist("pl1".into(), "Favorites".into(), true);
 
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1329,6 +1545,7 @@ mod tests {
 
         let controller = SyncController::start_inner(
             dirs.sync_db_file(),
+            dirs.sync_owner_file(),
             creds,
             source,
             SyncSettings::default(),
@@ -1370,6 +1587,209 @@ mod tests {
         .expect("clearing credentials should return Missing");
 
         controller.shutdown();
+        let _ = std::fs::remove_dir_all(dirs.config.parent().unwrap());
+    }
+
+    /// A playlist read that stops early is an error, never a partial list.
+    #[test]
+    fn a_playlist_read_cut_short_is_an_error_not_a_whole_list() {
+        assert!(next_page_offset(0, MAX_PLAYLIST_SYNC_PAGES, Some(50)).is_err());
+        assert_eq!(
+            next_page_offset(0, MAX_PLAYLIST_SYNC_PAGES - 1, Some(50)).unwrap(),
+            Some(50)
+        );
+        assert!(next_page_offset(50, 1, Some(50)).is_err());
+        assert_eq!(next_page_offset(50, 4, None).unwrap(), None);
+    }
+
+    #[test]
+    fn the_matcher_never_chooses_more_than_a_provider_serves() {
+        let provider = |max_quality| {
+            let config = QobuzConfig {
+                max_quality,
+                ..QobuzConfig::default()
+            };
+            let creds =
+                QobuzCredentials::new("123456".to_string(), "token".to_string(), None);
+            Arc::new(QobuzProvider::with_config(creds, config).unwrap()) as Arc<dyn Provider>
+        };
+        let narrow = provider(Quality::Flac16_44);
+        let full = provider(Quality::Flac24_192);
+
+        assert_eq!(
+            matcher_quality_ceiling(Quality::Flac24_192, std::slice::from_ref(&narrow)),
+            Quality::Flac16_44
+        );
+        assert_eq!(
+            matcher_quality_ceiling(Quality::Flac16_44, std::slice::from_ref(&full)),
+            Quality::Flac16_44
+        );
+        assert_eq!(
+            matcher_quality_ceiling(Quality::Flac24_96, &[full.clone(), narrow.clone()]),
+            Quality::Flac16_44
+        );
+        assert_eq!(
+            matcher_quality_ceiling(Quality::Flac24_96, &[]),
+            Quality::Flac24_96
+        );
+    }
+
+    #[tokio::test]
+    async fn a_worker_is_given_time_to_finish_its_step_before_it_is_aborted() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&finished);
+        let task = tokio::spawn(async move {
+            let _ = shutdown_rx.changed().await;
+            // The step in progress when the stop is requested.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        stop_tasks(Some(shutdown_tx), vec![task], Duration::from_secs(2)).await;
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_never_stops_is_aborted_after_the_grace_period() {
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+
+        stop_tasks(Some(shutdown_tx), vec![task], Duration::from_millis(50)).await;
+        assert!(abort.is_finished());
+    }
+
+    /// Sync state belongs to the account that made it: another account starts
+    /// empty, and state from before the owner file is kept by the first opener.
+    #[test]
+    fn sync_state_stays_with_the_account_that_made_it() {
+        let dirs = temp_dirs("owner");
+        let db = dirs.sync_db_file();
+        let owner = dirs.sync_owner_file();
+
+        {
+            let store = SyncStore::open(&db).unwrap();
+            store.set_playlist_enabled("legacy", "Old", true).unwrap();
+        }
+        let store = open_for_account(&db, &owner, "account-a", &[]).unwrap();
+        assert_eq!(store.list_synced_playlists().unwrap().len(), 1);
+        store
+            .set_playlist_enabled("pl1", "Favorites", true)
+            .unwrap();
+        drop(store);
+
+        let store = open_for_account(&db, &owner, "account-a", &[]).unwrap();
+        assert_eq!(store.list_synced_playlists().unwrap().len(), 2);
+        drop(store);
+
+        let store = open_for_account(&db, &owner, "account-b", &[]).unwrap();
+        assert!(store.list_synced_playlists().unwrap().is_empty());
+        assert_eq!(read_owner(&owner).as_deref(), Some("account-b"));
+        drop(store);
+
+        let _ = std::fs::remove_dir_all(dirs.config.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn sync_state_follows_the_signed_in_account() {
+        let dirs = temp_dirs("accounts");
+        let creds = CredentialStore::in_memory(dirs.clone());
+        let source = Arc::new(FakeSource::new());
+        let (state_tx, mut state_rx) = watch::channel(SyncUiState::default());
+        let on_state: SyncStateHook = Arc::new(move |state| {
+            let _ = state_tx.send(state);
+        });
+        let controller = SyncController::start_inner(
+            dirs.sync_db_file(),
+            dirs.sync_owner_file(),
+            creds,
+            source.clone(),
+            SyncSettings::default(),
+            dirs.state.join("sync"),
+            on_state,
+            QobuzConfig::default(),
+        );
+
+        controller.set_playlist("pl1".into(), "Favorites".into(), true);
+        wait_for_state(&mut state_rx, |s| s.is_playlist_enabled("pl1")).await;
+
+        // Signed out: none of the account's playlists are shown.
+        source.set_account(None);
+        wait_for_state(&mut state_rx, |s| s.playlists.is_empty()).await;
+
+        // Signed in again as the same account: its state is back.
+        source.set_account(Some("account-a"));
+        wait_for_state(&mut state_rx, |s| s.is_playlist_enabled("pl1")).await;
+
+        // Another account never sees it.
+        source.set_account(Some("account-b"));
+        wait_for_state(&mut state_rx, |s| s.playlists.is_empty()).await;
+
+        controller.shutdown();
+        let _ = std::fs::remove_dir_all(dirs.config.parent().unwrap());
+    }
+
+    /// Rejected new credentials change nothing that is saved or in use.
+    #[tokio::test]
+    async fn rejected_qobuz_credentials_leave_the_saved_ones_in_place() {
+        let dirs = temp_dirs("qobuz-rejected");
+        let creds = CredentialStore::in_memory(dirs.clone());
+        let saved = creds.clone();
+        let source = Arc::new(FakeSource::new());
+        let (base_url, server) = spawn_mock_qobuz_server().await;
+        let (state_tx, mut state_rx) = watch::channel(SyncUiState::default());
+        let on_state: SyncStateHook = Arc::new(move |state| {
+            let _ = state_tx.send(state);
+        });
+        let controller = SyncController::start_inner(
+            dirs.sync_db_file(),
+            dirs.sync_owner_file(),
+            creds,
+            source,
+            SyncSettings::default(),
+            dirs.state.join("sync"),
+            on_state,
+            QobuzConfig {
+                base_url,
+                ..QobuzConfig::default()
+            },
+        );
+
+        controller.save_qobuz_credentials("123456".into(), "valid-token".into(), None);
+        wait_for_state(&mut state_rx, |s| {
+            matches!(s.qobuz_credentials, CredentialStatus::Valid { .. })
+        })
+        .await;
+
+        controller.save_qobuz_credentials("999999".into(), "bad-token".into(), None);
+        wait_for_state(&mut state_rx, |s| {
+            matches!(s.qobuz_credentials, CredentialStatus::Invalid { .. })
+        })
+        .await;
+
+        let state = state_rx.borrow().clone();
+        assert_eq!(state.qobuz_app_id_hint.as_deref(), Some("123456"));
+        match &state.qobuz_credentials {
+            CredentialStatus::Invalid { message, .. } => {
+                assert!(message.contains("not saved"), "{message}");
+                assert!(
+                    !message.contains("bad-token") && !message.contains("999999"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected the rejection, got {other:?}"),
+        }
+        let kept = saved
+            .load_qobuz()
+            .await
+            .unwrap()
+            .expect("saved credentials remain");
+        assert_eq!(kept.app_id, "123456");
+        assert_eq!(kept.user_auth_token, "valid-token");
+
+        controller.shutdown();
+        server.abort();
         let _ = std::fs::remove_dir_all(dirs.config.parent().unwrap());
     }
 }

@@ -57,6 +57,13 @@ impl PlaylistTrack {
 #[async_trait]
 pub trait PlaylistSource: Send + Sync {
     async fn fetch_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<PlaylistTrack>>;
+
+    /// The account the source reads playlists for, or `None` when it has
+    /// none. The caller keeps sync state per account and clears it when this
+    /// changes. Sources without accounts keep the default.
+    fn account_key(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Configuration for [`PlaylistWatcher`].

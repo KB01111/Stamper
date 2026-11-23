@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 /// the single-instance files a running installed copy holds locked and the
 /// logs of its runs.
 const FOLDERS: fastframe_dirs::App = fastframe_dirs::App {
+    // The sync database's log is folded into sync.db before the copy (see
+    // `fold_sync_log`), so the log and its shared-memory index stay out.
     not_copied: &[
         "instance",
         "spotifast.log",
@@ -81,13 +83,27 @@ impl AppDirs {
     /// time from the per-user ones, or the per-user ones. Call it once this
     /// process is the running copy, before the window opens.
     pub fn discover() -> Found {
+        // A new portable folder copies the per-user sync database, which runs
+        // in WAL mode, so its committed rows must reach the main file first.
+        let mut fold = None;
+        if FOLDERS
+            .portable()
+            .folder()
+            .is_some_and(|folder| !folder.is_dir())
+            && let Some(installed) = FOLDERS.installed()
+        {
+            fold = fold_sync_log(&Self::from(installed));
+        }
         let found = FOLDERS.discover(|copy, from| {
             // The copy starts with the sign-in it was made from, under
             // credential entries of its own.
             crate::credentials::adopt_profile(&copy.state, &from.state)
         });
         let dirs = found.dirs.map_or_else(Self::fallback, Self::from);
-        let mut lines: Vec<_> = describe(&dirs, &found.mode).into_iter().collect();
+        let mut lines: Vec<_> = fold
+            .into_iter()
+            .chain(describe(&dirs, &found.mode))
+            .collect();
         let portable = matches!(found.mode, fastframe_dirs::Mode::Portable { .. });
         if portable {
             // The per-user file may be an installed copy's, so it stays.
@@ -170,6 +186,12 @@ impl AppDirs {
     /// Resumable SQLite database tracking lossless playlist sync state.
     pub fn sync_db_file(&self) -> PathBuf {
         self.state.join("sync.db")
+    }
+
+    /// The Spotify account the sync database was made for. Its state is
+    /// cleared when another account signs in, so it never mixes accounts.
+    pub fn sync_owner_file(&self) -> PathBuf {
+        self.state.join("sync-owner.json")
     }
 
     pub fn shared_web_token_file(&self) -> PathBuf {
@@ -304,6 +326,24 @@ fn adopt_window_file(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Folds the per-user sync database's write-ahead log into its main file
+/// before a portable copy takes its copy: the copy leaves the log out, so
+/// rows that are still only in it would be missing. A failure is returned as
+/// a log line only. The main file is still a consistent copy, just older.
+fn fold_sync_log(from: &AppDirs) -> Option<(log::Level, String)> {
+    let db = from.sync_db_file();
+    match spotisync::SyncStore::checkpoint(&db) {
+        Ok(()) => None,
+        Err(error) => Some((
+            log::Level::Warn,
+            format!(
+                "portable copy: unable to fold {} into its main file: {error}",
+                db.display()
+            ),
+        )),
+    }
+}
+
 /// The log line for the folders a copy uses, `dirs`, chosen for `mode`. An
 /// installed copy says nothing.
 fn describe(dirs: &AppDirs, mode: &fastframe_dirs::Mode) -> Option<(log::Level, String)> {
@@ -425,6 +465,28 @@ mod tests {
             line.contains("not usable") && line.contains("/user"),
             "{line}"
         );
+    }
+
+    /// The portable copy gets the sync rows that were still in the log.
+    #[test]
+    fn the_portable_copy_gets_the_sync_rows_still_in_the_log() {
+        let dir = folder("sync-log");
+        let from = AppDirs::from(fastframe_dirs::Dirs::inside(&dir.join("user")));
+        from.ensure().unwrap();
+        let store = spotisync::SyncStore::open(from.sync_db_file()).unwrap();
+        store
+            .set_playlist_enabled("pl1", "Favorites", true)
+            .unwrap();
+
+        assert!(fold_sync_log(&from).is_none());
+        let copy = dir.join("copy.db");
+        std::fs::copy(from.sync_db_file(), &copy).unwrap();
+        let copied = spotisync::SyncStore::open(&copy).unwrap();
+        assert_eq!(copied.list_synced_playlists().unwrap().len(), 1);
+
+        drop(copied);
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Installed copies, and every copy on Linux and macOS, keep the folders
