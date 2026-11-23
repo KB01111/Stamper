@@ -1,0 +1,119 @@
+[
+  {
+    "id": "R01_neg_clean_query_vs_uncensored_candidate",
+    "category": "negative_variant",
+    "query": { "isrc": null, "title": "Song (Clean)", "artists": ["Artist One"], "album": "Album", "duration_ms": 200000 },
+    "candidates": [
+      { "track_id": "r101", "isrc": null, "title": "Song", "artists": ["Artist One"], "duration_ms": 200000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "unmatched", "reason": "no_strict_match" }
+  },
+  {
+    "id": "R02_neg_uncensored_query_vs_clean_candidate",
+    "category": "negative_variant",
+    "query": { "isrc": null, "title": "Song", "artists": ["Artist One"], "album": "Album", "duration_ms": 200000 },
+    "candidates": [
+      { "track_id": "r102", "isrc": null, "title": "Song (Clean)", "artists": ["Artist One"], "duration_ms": 200000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "unmatched", "reason": "no_strict_match" }
+  },
+  {
+    "id": "R03_neg_explicit_query_vs_clean_candidate",
+    "category": "negative_variant",
+    "query": { "isrc": null, "title": "Song (Explicit)", "artists": ["Artist One"], "album": "Album", "duration_ms": 200000 },
+    "candidates": [
+      { "track_id": "r103", "isrc": null, "title": "Song (Clean)", "artists": ["Artist One"], "duration_ms": 200000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "unmatched", "reason": "no_strict_match" }
+  },
+  {
+    "id": "R04_exact_clean_query_matches_clean_candidate",
+    "category": "exact",
+    "query": { "isrc": null, "title": "Song (Clean)", "artists": ["Artist One"], "album": "Album", "duration_ms": 200000 },
+    "candidates": [
+      { "track_id": "r104", "isrc": null, "title": "Song (Clean)", "artists": ["Artist One"], "duration_ms": 200000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "exact", "track_id": "r104", "quality": "flac_16_44" }
+  },
+  {
+    "id": "R05_neg_part_one_vs_part_two_fuzzy_title",
+    "category": "negative_part",
+    "query": { "isrc": null, "title": "Shine On You Crazy Diamond (Part 1)", "artists": ["Pink Floyd"], "album": "Wish You Were Here", "duration_ms": 811000 },
+    "candidates": [
+      { "track_id": "r105", "isrc": null, "title": "Shine On You Crazy Diamond (Part 2)", "artists": ["Pink Floyd"], "duration_ms": 811000, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true }
+    ],
+    "expected": { "outcome": "unmatched", "reason": "no_strict_match" }
+  },
+  {
+    "id": "R06_neg_volume_one_vs_volume_two",
+    "category": "negative_part",
+    "query": { "isrc": null, "title": "Greatest Hits Vol. 1", "artists": ["Some Artist"], "album": "Greatest Hits", "duration_ms": 240000 },
+    "candidates": [
+      { "track_id": "r106", "isrc": null, "title": "Greatest Hits Vol. 2", "artists": ["Some Artist"], "duration_ms": 240000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "unmatched", "reason": "no_strict_match" }
+  },
+  {
+    "id": "R07_exact_pt_abbreviation_matches_part",
+    "category": "exact",
+    "query": { "isrc": null, "title": "Shine On You Crazy Diamond (Pt. 1)", "artists": ["Pink Floyd"], "album": "Wish You Were Here", "duration_ms": 811000 },
+    "candidates": [
+      { "track_id": "r107", "isrc": null, "title": "Shine On You Crazy Diamond (Part 1)", "artists": ["Pink Floyd"], "duration_ms": 811000, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true }
+    ],
+    "expected": { "outcome": "exact", "track_id": "r107", "quality": "flac_24_96" }
+  },
+  {
+    "id": "R08_exact_query_album_artist_fallback",
+    "category": "exact",
+    "query": { "isrc": null, "title": "Karma Police", "artists": [], "album_artist": "Radiohead", "album": "OK Computer", "duration_ms": 264000 },
+    "candidates": [
+      { "track_id": "r108", "isrc": null, "title": "Karma Police", "artists": ["Radiohead"], "duration_ms": 264000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "exact", "track_id": "r108", "quality": "flac_16_44" }
+  },
+  {
+    "id": "R09_exact_candidate_album_artist_fallback",
+    "category": "exact",
+    "query": { "isrc": null, "title": "Karma Police", "artists": ["Radiohead"], "album": "OK Computer", "duration_ms": 264000 },
+    "candidates": [
+      { "track_id": "r109", "isrc": null, "title": "Karma Police", "artists": [], "album_artist": "Radiohead", "duration_ms": 264000, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true }
+    ],
+    "expected": { "outcome": "exact", "track_id": "r109", "quality": "flac_24_96" }
+  },
+  {
+    "id": "R10_neg_placeholder_isrc_xx_is_not_an_isrc_match",
+    "category": "negative_isrc",
+    "query": { "isrc": "XX0000000000", "title": "Placeholder Track", "artists": ["Some Band"], "album": "Album", "duration_ms": 180000 },
+    "candidates": [
+      { "track_id": "r110", "isrc": "XX0000000000", "title": "Placeholder Track", "artists": ["Some Band"], "duration_ms": 180000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "exact", "track_id": "r110", "quality": "flac_16_44" }
+  },
+  {
+    "id": "R11_neg_placeholder_isrc_zero_is_not_an_isrc_match",
+    "category": "negative_isrc",
+    "query": { "isrc": "000000000000", "title": "Placeholder Track", "artists": ["Some Band"], "album": "Album", "duration_ms": 180000 },
+    "candidates": [
+      { "track_id": "r111", "isrc": "000000000000", "title": "Placeholder Track", "artists": ["Some Band"], "duration_ms": 180000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "exact", "track_id": "r111", "quality": "flac_16_44" }
+  },
+  {
+    "id": "R12_neg_with_qualifier_is_not_stripped",
+    "category": "negative_qualifier",
+    "query": { "isrc": null, "title": "Song (With Strings)", "artists": ["Artist One"], "album": "Album", "duration_ms": 200000 },
+    "candidates": [
+      { "track_id": "r112", "isrc": null, "title": "Song", "artists": ["Artist One"], "duration_ms": 200000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "unmatched", "reason": "no_strict_match" }
+  },
+  {
+    "id": "R13_exact_with_or_without_you_title_kept",
+    "category": "exact",
+    "query": { "isrc": null, "title": "With or Without You", "artists": ["U2"], "album": "The Joshua Tree", "duration_ms": 296000 },
+    "candidates": [
+      { "track_id": "r113", "isrc": null, "title": "With or Without You", "artists": ["U2"], "duration_ms": 296000, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true }
+    ],
+    "expected": { "outcome": "exact", "track_id": "r113", "quality": "flac_24_96" }
+  }
+]
