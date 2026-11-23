@@ -1,0 +1,464 @@
+[
+  {
+    "id": "01_isrc_exact_hires",
+    "category": "isrc",
+    "query": { "isrc": "USQX91300105", "title": "Instant Crush", "artists": ["Daft Punk", "Julian Casablancas"], "album": "Random Access Memories", "duration_ms": 337560 },
+    "candidates": [
+      { "track_id": "q101", "isrc": "USQX91300105", "title": "Instant Crush", "artists": ["Daft Punk"], "duration_ms": 337000, "bit_depth": 24, "sample_rate_hz": 88200, "lossless": true }
+    ],
+    "expected": { "outcome": "isrc", "track_id": "q101", "quality": "flac_24_96" }
+  },
+  {
+    "id": "02_isrc_lowercase_hyphens",
+    "category": "isrc",
+    "query": { "isrc": "gb-ay-e-06-01477", "title": "Time", "artists": ["Pink Floyd"], "album": "The Dark Side of the Moon", "duration_ms": 413947 },
+    "candidates": [
+      { "track_id": "q102", "isrc": "GBAYE0601477", "title": "Time (2011 Remastered Version)", "artists": ["Pink Floyd"], "duration_ms": 414000, "bit_depth": 24, "sample_rate_hz": 192000, "lossless": true }
+    ],
+    "expected": { "outcome": "isrc", "track_id": "q102", "quality": "flac_24_192" }
+  },
+  {
+    "id": "03_isrc_prefers_highest_lossless_quality",
+    "category": "isrc",
+    "query": { "isrc": "USRC17607839", "title": "Bohemian Rhapsody", "artists": ["Queen"], "album": "A Night at the Opera", "duration_ms": 354320 },
+    "candidates": [
+      { "track_id": "q103_cd", "isrc": "USRC17607839", "title": "Bohemian Rhapsody", "artists": ["Queen"], "duration_ms": 354000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true },
+      { "track_id": "q103_hr", "isrc": "USRC17607839", "title": "Bohemian Rhapsody", "artists": ["Queen"], "duration_ms": 354000, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true }
+    ],
+    "expected": { "outcome": "isrc", "track_id": "q103_hr", "quality": "flac_24_96" }
+  },
+  {
+    "id": "04_isrc_skips_lossy_picks_lossless",
+    "category": "isrc",
+    "query": { "isrc": "USUM71703861", "title": "HUMBLE.", "artists": ["Kendrick Lamar"], "album": "DAMN.", "duration_ms": 177000 },
+    "candidates": [
+      { "track_id": "q104_mp3", "isrc": "USUM71703861", "title": "HUMBLE.", "artists": ["Kendrick Lamar"], "duration_ms": 177000, "bit_depth": null, "sample_rate_hz": 44100, "lossless": false },
+      { "track_id": "q104_flac", "isrc": "USUM71703861", "title": "HUMBLE.", "artists": ["Kendrick Lamar"], "duration_ms": 177000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "isrc", "track_id": "q104_flac", "quality": "flac_16_44" }
+  },
+  {
+    "id": "05_isrc_beats_non_isrc_exact",
+    "category": "isrc",
+    "query": { "isrc": "USSM19902989", "title": "All Along the Watchtower", "artists": ["Jimi Hendrix"], "album": "Electric Ladyland", "duration_ms": 241000 },
+    "candidates": [
+      { "track_id": "q105_no_isrc", "isrc": null, "title": "All Along the Watchtower", "artists": ["Jimi Hendrix"], "duration_ms": 241000, "bit_depth": 24, "sample_rate_hz": 192000, "lossless": true },
+      { "track_id": "q105_isrc", "isrc": "USSM19902989", "title": "All Along the Watchtower", "artists": ["The Jimi Hendrix Experience"], "duration_ms": 241000, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true }
+    ],
+    "expected": { "outcome": "isrc", "track_id": "q105_isrc", "quality": "flac_24_96" }
+  },
+  {
+    "id": "06_isrc_accepts_localized_title",
+    "category": "isrc",
+    "query": { "isrc": "JPPO01801234", "title": "Plastic Love", "artists": ["Mariya Takeuchi"], "album": "Variety", "duration_ms": 293000 },
+    "candidates": [
+      { "track_id": "q106", "isrc": "JPPO01801234", "title": "プラスティック・ラブ", "artists": ["竹内まりや"], "duration_ms": 293000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "isrc", "track_id": "q106", "quality": "flac_16_44" }
+  },
+  {
+    "id": "07_isrc_respects_quality_ceiling",
+    "category": "isrc",
+    "max_quality": "flac_24_96",
+    "query": { "isrc": "USWB11302221", "title": "Dreams", "artists": ["Fleetwood Mac"], "album": "Rumours", "duration_ms": 257800 },
+    "candidates": [
+      { "track_id": "q107_192", "isrc": "USWB11302221", "title": "Dreams", "artists": ["Fleetwood Mac"], "duration_ms": 258000, "bit_depth": 24, "sample_rate_hz": 192000, "lossless": true },
+      { "track_id": "q107_16", "isrc": "USWB11302221", "title": "Dreams", "artists": ["Fleetwood Mac"], "duration_ms": 258000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "isrc", "track_id": "q107_192", "quality": "flac_24_96" }
+  },
+  {
+    "id": "08_isrc_ignores_spaces",
+    "category": "isrc",
+    "query": { "isrc": "US AT2 01 00123", "title": "Stairway to Heaven", "artists": ["Led Zeppelin"], "album": "Led Zeppelin IV", "duration_ms": 482000 },
+    "candidates": [
+      { "track_id": "q108", "isrc": "USAT20100123", "title": "Stairway to Heaven (Remaster)", "artists": ["Led Zeppelin"], "duration_ms": 482000, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true }
+    ],
+    "expected": { "outcome": "isrc", "track_id": "q108", "quality": "flac_24_96" }
+  },
+  {
+    "id": "09_isrc_non_matching_falls_through_to_exact",
+    "category": "exact",
+    "query": { "isrc": "USZZ10000001", "title": "Paranoid Android", "artists": ["Radiohead"], "album": "OK Computer", "duration_ms": 383000 },
+    "candidates": [
+      { "track_id": "q109", "isrc": "GBAYE9701371", "title": "Paranoid Android", "artists": ["Radiohead"], "duration_ms": 383500, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "exact", "track_id": "q109", "quality": "flac_16_44" }
+  },
+  {
+    "id": "10_isrc_prefers_closer_duration_on_quality_tie",
+    "category": "isrc",
+    "query": { "isrc": "GBUM71505904", "title": "Let It Happen", "artists": ["Tame Impala"], "album": "Currents", "duration_ms": 467587 },
+    "candidates": [
+      { "track_id": "q110_far", "isrc": "GBUM71505904", "title": "Let It Happen", "artists": ["Tame Impala"], "duration_ms": 470000, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true },
+      { "track_id": "q110_close", "isrc": "GBUM71505904", "title": "Let It Happen", "artists": ["Tame Impala"], "duration_ms": 467600, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true }
+    ],
+    "expected": { "outcome": "isrc", "track_id": "q110_close", "quality": "flac_24_96" }
+  },
+  {
+    "id": "11_isrc_multiple_candidates_one_match",
+    "category": "isrc",
+    "query": { "isrc": "USUG11904206", "title": "Blinding Lights", "artists": ["The Weeknd"], "album": "After Hours", "duration_ms": 200040 },
+    "candidates": [
+      { "track_id": "q111_wrong", "isrc": "USUG12000001", "title": "Blinding Lights (Chromatics Remix)", "artists": ["The Weeknd"], "duration_ms": 261000, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true },
+      { "track_id": "q111_right", "isrc": "USUG11904206", "title": "Blinding Lights", "artists": ["The Weeknd"], "duration_ms": 200000, "bit_depth": 24, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "isrc", "track_id": "q111_right", "quality": "flac_24_96" }
+  },
+  {
+    "id": "12_isrc_24_192_studio_master",
+    "category": "isrc",
+    "query": { "isrc": "USSM15900112", "title": "So What", "artists": ["Miles Davis"], "album": "Kind of Blue", "duration_ms": 562500 },
+    "candidates": [
+      { "track_id": "q112", "isrc": "USSM15900112", "title": "So What", "artists": ["Miles Davis"], "duration_ms": 562000, "bit_depth": 24, "sample_rate_hz": 192000, "lossless": true }
+    ],
+    "expected": { "outcome": "isrc", "track_id": "q112", "quality": "flac_24_192" }
+  },
+  {
+    "id": "13_exact_strips_feat_parens",
+    "category": "exact",
+    "query": { "isrc": null, "title": "Get Lucky (feat. Pharrell Williams and Nile Rodgers)", "artists": ["Daft Punk"], "album": "Random Access Memories", "duration_ms": 369626 },
+    "candidates": [
+      { "track_id": "q201", "isrc": null, "title": "Get Lucky", "artists": ["Daft Punk"], "duration_ms": 369000, "bit_depth": 24, "sample_rate_hz": 88200, "lossless": true }
+    ],
+    "expected": { "outcome": "exact", "track_id": "q201", "quality": "flac_24_96" }
+  },
+  {
+    "id": "14_exact_strips_feat_brackets_and_ft",
+    "category": "exact",
+    "query": { "isrc": null, "title": "Empire State Of Mind [feat. Alicia Keys]", "artists": ["JAY-Z"], "album": "The Blueprint 3", "duration_ms": 276920 },
+    "candidates": [
+      { "track_id": "q202", "isrc": null, "title": "Empire State of Mind ft. Alicia Keys", "artists": ["Jay-Z"], "duration_ms": 277000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "exact", "track_id": "q202", "quality": "flac_16_44" }
+  },
+  {
+    "id": "15_exact_strips_remastered_hyphen",
+    "category": "exact",
+    "query": { "isrc": null, "title": "Heroes - 2017 Remaster", "artists": ["David Bowie"], "album": "Heroes", "duration_ms": 371413 },
+    "candidates": [
+      { "track_id": "q203", "isrc": null, "title": "Heroes", "artists": ["David Bowie"], "duration_ms": 371000, "bit_depth": 24, "sample_rate_hz": 192000, "lossless": true }
+    ],
+    "expected": { "outcome": "exact", "track_id": "q203", "quality": "flac_24_192" }
+  },
+  {
+    "id": "16_exact_strips_remaster_parens",
+    "category": "exact",
+    "query": { "isrc": null, "title": "Wish You Were Here", "artists": ["Pink Floyd"], "album": "Wish You Were Here", "duration_ms": 334744 },
+    "candidates": [
+      { "track_id": "q204", "isrc": null, "title": "Wish You Were Here (2011 Remaster)", "artists": ["Pink Floyd"], "duration_ms": 335000, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true }
+    ],
+    "expected": { "outcome": "exact", "track_id": "q204", "quality": "flac_24_96" }
+  },
+  {
+    "id": "17_exact_diacritics_folding",
+    "category": "exact",
+    "query": { "isrc": null, "title": "Jóga", "artists": ["Björk"], "album": "Homogenic", "duration_ms": 305160 },
+    "candidates": [
+      { "track_id": "q205", "isrc": null, "title": "Joga", "artists": ["Bjork"], "duration_ms": 305000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "exact", "track_id": "q205", "quality": "flac_16_44" }
+  },
+  {
+    "id": "18_exact_ampersand_and_punctuation",
+    "category": "exact",
+    "query": { "isrc": null, "title": "Don't Stop Me Now", "artists": ["Simon & Garfunkel"], "album": "Greatest Hits", "duration_ms": 209413 },
+    "candidates": [
+      { "track_id": "q206", "isrc": null, "title": "Dont Stop Me Now!", "artists": ["Simon and Garfunkel"], "duration_ms": 210000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "exact", "track_id": "q206", "quality": "flac_16_44" }
+  },
+  {
+    "id": "19_exact_duration_at_2000ms_boundary",
+    "category": "exact",
+    "query": { "isrc": null, "title": "Teardrop", "artists": ["Massive Attack"], "album": "Mezzanine", "duration_ms": 329000 },
+    "candidates": [
+      { "track_id": "q207", "isrc": null, "title": "Teardrop", "artists": ["Massive Attack"], "duration_ms": 331000, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true }
+    ],
+    "expected": { "outcome": "exact", "track_id": "q207", "quality": "flac_24_96" }
+  },
+  {
+    "id": "20_exact_live_query_matches_live_candidate",
+    "category": "exact",
+    "query": { "isrc": null, "title": "Hotel California (Live)", "artists": ["Eagles"], "album": "Hell Freezes Over", "duration_ms": 432000 },
+    "candidates": [
+      { "track_id": "q208_studio", "isrc": null, "title": "Hotel California", "artists": ["Eagles"], "duration_ms": 432000, "bit_depth": 24, "sample_rate_hz": 192000, "lossless": true },
+      { "track_id": "q208_live", "isrc": null, "title": "Hotel California - Live", "artists": ["Eagles"], "duration_ms": 432500, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "exact", "track_id": "q208_live", "quality": "flac_16_44" }
+  },
+  {
+    "id": "21_exact_remix_query_matches_remix_candidate",
+    "category": "exact",
+    "query": { "isrc": null, "title": "Midnight City (Eric Prydz Private Remix)", "artists": ["M83"], "album": "Midnight City", "duration_ms": 361000 },
+    "candidates": [
+      { "track_id": "q209_orig", "isrc": null, "title": "Midnight City", "artists": ["M83"], "duration_ms": 361000, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true },
+      { "track_id": "q209_rmx", "isrc": null, "title": "Midnight City (Eric Prydz Private Remix)", "artists": ["M83"], "duration_ms": 360500, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "exact", "track_id": "q209_rmx", "quality": "flac_16_44" }
+  },
+  {
+    "id": "22_exact_acoustic_query_matches_acoustic_candidate",
+    "category": "exact",
+    "query": { "isrc": null, "title": "Everlong (Acoustic)", "artists": ["Foo Fighters"], "album": "Greatest Hits", "duration_ms": 252000 },
+    "candidates": [
+      { "track_id": "q210_studio", "isrc": null, "title": "Everlong", "artists": ["Foo Fighters"], "duration_ms": 252000, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true },
+      { "track_id": "q210_ac", "isrc": null, "title": "Everlong - Acoustic", "artists": ["Foo Fighters"], "duration_ms": 252200, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "exact", "track_id": "q210_ac", "quality": "flac_16_44" }
+  },
+  {
+    "id": "23_exact_prefers_highest_quality_same_tier",
+    "category": "exact",
+    "query": { "isrc": null, "title": "Nude", "artists": ["Radiohead"], "album": "In Rainbows", "duration_ms": 255387 },
+    "candidates": [
+      { "track_id": "q211_cd", "isrc": null, "title": "Nude", "artists": ["Radiohead"], "duration_ms": 255000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true },
+      { "track_id": "q211_192", "isrc": null, "title": "Nude", "artists": ["Radiohead"], "duration_ms": 255400, "bit_depth": 24, "sample_rate_hz": 192000, "lossless": true }
+    ],
+    "expected": { "outcome": "exact", "track_id": "q211_192", "quality": "flac_24_192" }
+  },
+  {
+    "id": "24_exact_artist_with_feat_in_candidate",
+    "category": "exact",
+    "query": { "isrc": null, "title": "Crazy in Love", "artists": ["Beyoncé", "JAY-Z"], "album": "Dangerously in Love", "duration_ms": 236133 },
+    "candidates": [
+      { "track_id": "q212", "isrc": null, "title": "Crazy in Love", "artists": ["Beyonce feat. JAY-Z"], "duration_ms": 236000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "exact", "track_id": "q212", "quality": "flac_16_44" }
+  },
+  {
+    "id": "25_fuzzy_duration_3500ms_delta",
+    "category": "fuzzy",
+    "query": { "isrc": null, "title": "Everything In Its Right Place", "artists": ["Radiohead"], "album": "Kid A", "duration_ms": 251426 },
+    "candidates": [
+      { "track_id": "q301", "isrc": null, "title": "Everything In Its Right Place", "artists": ["Radiohead"], "duration_ms": 254900, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "fuzzy", "track_id": "q301", "quality": "flac_16_44" }
+  },
+  {
+    "id": "26_fuzzy_minor_spelling_variant",
+    "category": "fuzzy",
+    "query": { "isrc": null, "title": "Subterranean Homesick Alien", "artists": ["Radiohead"], "album": "OK Computer", "duration_ms": 267000 },
+    "candidates": [
+      { "track_id": "q302", "isrc": null, "title": "Subterranean Homesick Aliens", "artists": ["Radiohead"], "duration_ms": 267000, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true }
+    ],
+    "expected": { "outcome": "fuzzy", "track_id": "q302", "quality": "flac_24_96" }
+  },
+  {
+    "id": "27_fuzzy_leading_the_in_artist",
+    "category": "fuzzy",
+    "query": { "isrc": null, "title": "Paint It Black", "artists": ["The Rolling Stones"], "album": "Aftermath", "duration_ms": 202266 },
+    "candidates": [
+      { "track_id": "q303", "isrc": null, "title": "Paint It, Black", "artists": ["Rolling Stones"], "duration_ms": 202000, "bit_depth": 24, "sample_rate_hz": 192000, "lossless": true }
+    ],
+    "expected": { "outcome": "fuzzy", "track_id": "q303", "quality": "flac_24_192" }
+  },
+  {
+    "id": "28_fuzzy_part_abbreviation_and_delta",
+    "category": "fuzzy",
+    "query": { "isrc": null, "title": "Shine On You Crazy Diamond (Pts. 1-5)", "artists": ["Pink Floyd"], "album": "Wish You Were Here", "duration_ms": 811000 },
+    "candidates": [
+      { "track_id": "q304", "isrc": null, "title": "Shine On You Crazy Diamond (Parts 1-5)", "artists": ["Pink Floyd"], "duration_ms": 814000, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true }
+    ],
+    "expected": { "outcome": "fuzzy", "track_id": "q304", "quality": "flac_24_96" }
+  },
+  {
+    "id": "29_fuzzy_single_char_artist_typo",
+    "category": "fuzzy",
+    "query": { "isrc": null, "title": "Hyperballad", "artists": ["Björk"], "album": "Post", "duration_ms": 321000 },
+    "candidates": [
+      { "track_id": "q305", "isrc": null, "title": "Hyper-Ballad", "artists": ["Bjork"], "duration_ms": 321500, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "fuzzy", "track_id": "q305", "quality": "flac_16_44" }
+  },
+  {
+    "id": "30_fuzzy_british_vs_american_spelling",
+    "category": "fuzzy",
+    "query": { "isrc": null, "title": "Any Colour You Like", "artists": ["Pink Floyd"], "album": "The Dark Side of the Moon", "duration_ms": 206000 },
+    "candidates": [
+      { "track_id": "q306", "isrc": null, "title": "Any Color You Like", "artists": ["Pink Floyd"], "duration_ms": 206000, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true }
+    ],
+    "expected": { "outcome": "fuzzy", "track_id": "q306", "quality": "flac_24_96" }
+  },
+  {
+    "id": "31_fuzzy_duration_at_5000ms_boundary",
+    "category": "fuzzy",
+    "query": { "isrc": null, "title": "A Day in the Life", "artists": ["The Beatles"], "album": "Sgt. Pepper", "duration_ms": 333000 },
+    "candidates": [
+      { "track_id": "q307", "isrc": null, "title": "A Day in the Life", "artists": ["The Beatles"], "duration_ms": 338000, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true }
+    ],
+    "expected": { "outcome": "fuzzy", "track_id": "q307", "quality": "flac_24_96" }
+  },
+  {
+    "id": "32_fuzzy_title_with_extra_article",
+    "category": "fuzzy",
+    "query": { "isrc": null, "title": "Breathe (In the Air)", "artists": ["Pink Floyd"], "album": "The Dark Side of the Moon", "duration_ms": 169000 },
+    "candidates": [
+      { "track_id": "q308", "isrc": null, "title": "Breathe in the Air", "artists": ["Pink Floyd"], "duration_ms": 172000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "fuzzy", "track_id": "q308", "quality": "flac_16_44" }
+  },
+  {
+    "id": "33_fuzzy_prefers_highest_quality_same_tier",
+    "category": "fuzzy",
+    "query": { "isrc": null, "title": "Around the World", "artists": ["Daft Punk"], "album": "Homework", "duration_ms": 429000 },
+    "candidates": [
+      { "track_id": "q309_cd", "isrc": null, "title": "Around the World", "artists": ["Daft Punk"], "duration_ms": 433000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true },
+      { "track_id": "q309_hr", "isrc": null, "title": "Around the World", "artists": ["Daft Punk"], "duration_ms": 433000, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true }
+    ],
+    "expected": { "outcome": "fuzzy", "track_id": "q309_hr", "quality": "flac_24_96" }
+  },
+  {
+    "id": "34_fuzzy_missing_punctuation_in_artist",
+    "category": "fuzzy",
+    "query": { "isrc": null, "title": "See You Again", "artists": ["Tyler, The Creator"], "album": "Flower Boy", "duration_ms": 180386 },
+    "candidates": [
+      { "track_id": "q310", "isrc": null, "title": "See You Again", "artists": ["Tyler The Creator"], "duration_ms": 183000, "bit_depth": 24, "sample_rate_hz": 48000, "lossless": true }
+    ],
+    "expected": { "outcome": "fuzzy", "track_id": "q310", "quality": "flac_24_96" }
+  },
+  {
+    "id": "35_neg_studio_vs_live",
+    "category": "negative_variant",
+    "query": { "isrc": null, "title": "Comfortably Numb", "artists": ["Pink Floyd"], "album": "The Wall", "duration_ms": 382000 },
+    "candidates": [
+      { "track_id": "q401", "isrc": null, "title": "Comfortably Numb (Live)", "artists": ["Pink Floyd"], "duration_ms": 382000, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true }
+    ],
+    "expected": { "outcome": "unmatched", "reason": "no_strict_match" }
+  },
+  {
+    "id": "36_neg_live_vs_studio",
+    "category": "negative_variant",
+    "query": { "isrc": null, "title": "Comfortably Numb (Live at Pompeii)", "artists": ["Pink Floyd"], "album": "Pompeii", "duration_ms": 382000 },
+    "candidates": [
+      { "track_id": "q402", "isrc": null, "title": "Comfortably Numb", "artists": ["Pink Floyd"], "duration_ms": 382000, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true }
+    ],
+    "expected": { "outcome": "unmatched", "reason": "no_strict_match" }
+  },
+  {
+    "id": "37_neg_studio_vs_remix",
+    "category": "negative_variant",
+    "query": { "isrc": null, "title": "Blinding Lights", "artists": ["The Weeknd"], "album": "After Hours", "duration_ms": 200000 },
+    "candidates": [
+      { "track_id": "q403", "isrc": null, "title": "Blinding Lights (Major Lazer Remix)", "artists": ["The Weeknd"], "duration_ms": 201000, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true }
+    ],
+    "expected": { "outcome": "unmatched", "reason": "no_strict_match" }
+  },
+  {
+    "id": "38_neg_studio_vs_acoustic",
+    "category": "negative_variant",
+    "query": { "isrc": null, "title": "Take On Me", "artists": ["a-ha"], "album": "Hunting High and Low", "duration_ms": 225000 },
+    "candidates": [
+      { "track_id": "q404", "isrc": null, "title": "Take On Me (Acoustic)", "artists": ["a-ha"], "duration_ms": 225500, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true }
+    ],
+    "expected": { "outcome": "unmatched", "reason": "no_strict_match" }
+  },
+  {
+    "id": "39_neg_studio_vs_unplugged",
+    "category": "negative_variant",
+    "query": { "isrc": null, "title": "About a Girl", "artists": ["Nirvana"], "album": "Bleach", "duration_ms": 168000 },
+    "candidates": [
+      { "track_id": "q405", "isrc": null, "title": "About a Girl (MTV Unplugged)", "artists": ["Nirvana"], "duration_ms": 169000, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true }
+    ],
+    "expected": { "outcome": "unmatched", "reason": "no_strict_match" }
+  },
+  {
+    "id": "40_neg_studio_vs_karaoke",
+    "category": "negative_variant",
+    "query": { "isrc": null, "title": "Bohemian Rhapsody", "artists": ["Queen"], "album": "A Night at the Opera", "duration_ms": 354000 },
+    "candidates": [
+      { "track_id": "q406", "isrc": null, "title": "Bohemian Rhapsody (Karaoke Version)", "artists": ["Queen"], "duration_ms": 354000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "unmatched", "reason": "no_strict_match" }
+  },
+  {
+    "id": "41_neg_studio_vs_instrumental",
+    "category": "negative_variant",
+    "query": { "isrc": null, "title": "Bad Guy", "artists": ["Billie Eilish"], "album": "WHEN WE ALL FALL ASLEEP", "duration_ms": 194000 },
+    "candidates": [
+      { "track_id": "q407", "isrc": null, "title": "Bad Guy (Instrumental)", "artists": ["Billie Eilish"], "duration_ms": 194000, "bit_depth": 24, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "unmatched", "reason": "no_strict_match" }
+  },
+  {
+    "id": "42_neg_studio_vs_demo",
+    "category": "negative_variant",
+    "query": { "isrc": null, "title": "Smells Like Teen Spirit", "artists": ["Nirvana"], "album": "Nevermind", "duration_ms": 301000 },
+    "candidates": [
+      { "track_id": "q408", "isrc": null, "title": "Smells Like Teen Spirit (Demo)", "artists": ["Nirvana"], "duration_ms": 301000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "unmatched", "reason": "no_strict_match" }
+  },
+  {
+    "id": "43_neg_studio_vs_cover_tribute",
+    "category": "negative_variant",
+    "query": { "isrc": null, "title": "Africa", "artists": ["Toto"], "album": "Toto IV", "duration_ms": 295000 },
+    "candidates": [
+      { "track_id": "q409", "isrc": null, "title": "Africa (Tribute to Toto)", "artists": ["Toto"], "duration_ms": 295000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "unmatched", "reason": "no_strict_match" }
+  },
+  {
+    "id": "44_neg_studio_vs_sped_up",
+    "category": "negative_variant",
+    "query": { "isrc": null, "title": "Sweater Weather", "artists": ["The Neighbourhood"], "album": "I Love You.", "duration_ms": 240000 },
+    "candidates": [
+      { "track_id": "q410", "isrc": null, "title": "Sweater Weather (Sped Up)", "artists": ["The Neighbourhood"], "duration_ms": 240000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "unmatched", "reason": "no_strict_match" }
+  },
+  {
+    "id": "45_neg_studio_vs_slowed_reverb",
+    "category": "negative_variant",
+    "query": { "isrc": null, "title": "After Dark", "artists": ["Mr.Kitty"], "album": "Time", "duration_ms": 259000 },
+    "candidates": [
+      { "track_id": "q411", "isrc": null, "title": "After Dark (Slowed + Reverb)", "artists": ["Mr.Kitty"], "duration_ms": 260000, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "unmatched", "reason": "no_strict_match" }
+  },
+  {
+    "id": "46_neg_radio_edit_vs_extended",
+    "category": "negative_variant",
+    "query": { "isrc": null, "title": "Get Lucky (Radio Edit)", "artists": ["Daft Punk"], "album": "Get Lucky", "duration_ms": 248000 },
+    "candidates": [
+      { "track_id": "q412", "isrc": null, "title": "Get Lucky (Extended Mix)", "artists": ["Daft Punk"], "duration_ms": 248500, "bit_depth": 24, "sample_rate_hz": 88200, "lossless": true }
+    ],
+    "expected": { "outcome": "unmatched", "reason": "no_strict_match" }
+  },
+  {
+    "id": "47_neg_live_word_in_title_vs_live_recording",
+    "category": "negative_variant",
+    "query": { "isrc": null, "title": "Live Forever", "artists": ["Oasis"], "album": "Definitely Maybe", "duration_ms": 276000 },
+    "candidates": [
+      { "track_id": "q413", "isrc": null, "title": "Live Forever (Live at Maine Road)", "artists": ["Oasis"], "duration_ms": 276500, "bit_depth": 16, "sample_rate_hz": 44100, "lossless": true }
+    ],
+    "expected": { "outcome": "unmatched", "reason": "no_strict_match" }
+  },
+  {
+    "id": "48_neg_same_title_different_artist",
+    "category": "negative_artist",
+    "query": { "isrc": null, "title": "Hello", "artists": ["Adele"], "album": "25", "duration_ms": 295000 },
+    "candidates": [
+      { "track_id": "q414", "isrc": null, "title": "Hello", "artists": ["Lionel Richie"], "duration_ms": 295000, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true }
+    ],
+    "expected": { "outcome": "unmatched", "reason": "no_strict_match" }
+  },
+  {
+    "id": "49_neg_duration_outside_tolerance",
+    "category": "negative_duration",
+    "query": { "isrc": null, "title": "Around the World", "artists": ["Daft Punk"], "album": "Homework", "duration_ms": 429000 },
+    "candidates": [
+      { "track_id": "q415", "isrc": null, "title": "Around the World", "artists": ["Daft Punk"], "duration_ms": 440000, "bit_depth": 24, "sample_rate_hz": 96000, "lossless": true }
+    ],
+    "expected": { "outcome": "unmatched", "reason": "no_strict_match" }
+  },
+  {
+    "id": "50_neg_lossy_only_rejected",
+    "category": "negative_lossy",
+    "query": { "isrc": "USQX91300105", "title": "Instant Crush", "artists": ["Daft Punk"], "album": "Random Access Memories", "duration_ms": 337000 },
+    "candidates": [
+      { "track_id": "q416", "isrc": "USQX91300105", "title": "Instant Crush", "artists": ["Daft Punk"], "duration_ms": 337000, "bit_depth": null, "sample_rate_hz": 44100, "lossless": false }
+    ],
+    "expected": { "outcome": "unmatched", "reason": "lossy_only" }
+  }
+]

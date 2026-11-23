@@ -1,0 +1,99 @@
+{
+  "query": "Daft Punk Instant Crush",
+  "tracks": {
+    "limit": 20,
+    "offset": 0,
+    "total": 3,
+    "items": [
+      {
+        "id": 10760101,
+        "title": "Instant Crush",
+        "version": null,
+        "isrc": "USQX91300105",
+        "duration": 337,
+        "track_number": 5,
+        "media_number": 1,
+        "hires": true,
+        "hires_streamable": true,
+        "streamable": true,
+        "maximum_bit_depth": 24,
+        "maximum_sampling_rate": 88.2,
+        "performer": {
+          "id": 36819,
+          "name": "Daft Punk"
+        },
+        "album": {
+          "id": "0886443919266",
+          "title": "Random Access Memories",
+          "artist": {
+            "id": 36819,
+            "name": "Daft Punk"
+          },
+          "release_date_original": "2013-05-17",
+          "image": {
+            "large": "https://static.qobuz.com/images/covers/66/92/0886443919266_600.jpg",
+            "small": "https://static.qobuz.com/images/covers/66/92/0886443919266_230.jpg",
+            "thumbnail": "https://static.qobuz.com/images/covers/66/92/0886443919266_50.jpg"
+          }
+        }
+      },
+      {
+        "id": 10760102,
+        "title": "Instant Crush",
+        "version": "Live",
+        "isrc": "USQX91400999",
+        "duration": 352,
+        "track_number": 9,
+        "media_number": 1,
+        "hires": false,
+        "hires_streamable": false,
+        "streamable": true,
+        "maximum_bit_depth": 16,
+        "maximum_sampling_rate": 44.1,
+        "performer": {
+          "id": 36819,
+          "name": "Daft Punk"
+        },
+        "album": {
+          "id": "0886443999999",
+          "title": "Alive Sessions",
+          "artist": {
+            "id": 36819,
+            "name": "Daft Punk"
+          },
+          "release_date_original": "2014-09-01",
+          "image": {
+            "small": "https://static.qobuz.com/images/covers/99/99/0886443999999_230.jpg"
+          }
+        }
+      },
+      {
+        "id": 10760103,
+        "title": "Instant Crush",
+        "version": "Radio Edit",
+        "isrc": "USQX91300888",
+        "duration": 250,
+        "track_number": 1,
+        "media_number": 1,
+        "hires": false,
+        "hires_streamable": false,
+        "streamable": false,
+        "maximum_bit_depth": 16,
+        "maximum_sampling_rate": 44.1,
+        "performer": {
+          "id": 36819,
+          "name": "Daft Punk"
+        },
+        "album": {
+          "id": "0886443919267",
+          "title": "Instant Crush (Single)",
+          "artist": {
+            "id": 36819,
+            "name": "Daft Punk"
+          },
+          "release_date_original": "2013-11-22"
+        }
+      }
+    ]
+  }
+}
