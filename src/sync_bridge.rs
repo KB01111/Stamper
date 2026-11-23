@@ -1609,8 +1609,7 @@ mod tests {
                 max_quality,
                 ..QobuzConfig::default()
             };
-            let creds =
-                QobuzCredentials::new("123456".to_string(), "token".to_string(), None);
+            let creds = QobuzCredentials::new("123456".to_string(), "token".to_string(), None);
             Arc::new(QobuzProvider::with_config(creds, config).unwrap()) as Arc<dyn Provider>
         };
         let narrow = provider(Quality::Flac16_44);
