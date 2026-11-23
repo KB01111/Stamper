@@ -1,0 +1,21 @@
+[package]
+name = "spotisync"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+description = "Lossless playlist sync engine for Spotifast"
+
+[dependencies]
+# Async trait object support for Provider and PlaylistSource.
+async-trait = "0.1"
+bytes = "1"
+http = "1"
+log = "0.4"
+md-5 = "0.10"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs", "net", "io-util"] }
