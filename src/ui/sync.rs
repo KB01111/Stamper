@@ -4,6 +4,7 @@
 //! All state mutations go through [`Action`] values pushed to `app.actions`;
 //! nothing here touches SQLite, disk, or network on the UI thread.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -15,7 +16,7 @@ use spotisync::{PlaylistCounts, ProviderCooldown, SyncStatus, SyncedPlaylist};
 
 use crate::api::models::PlayableItem;
 use crate::app::App;
-use crate::i18n::gettext;
+use crate::i18n::{Locale, gettext, ngettext};
 use crate::local_player::LocalFlacTrack;
 use crate::model::{Action, Page, RowContext};
 use crate::settings::SyncQualityCeiling;
@@ -79,27 +80,29 @@ fn format_quality_badge(raw: &str) -> String {
 }
 
 /// Formats an active provider rate-limit cooldown for banner display.
-pub(crate) fn format_cooldown_banner(cooldown: &ProviderCooldown) -> String {
+pub(crate) fn format_cooldown_banner(locale: Locale, cooldown: &ProviderCooldown) -> String {
     if cooldown.remaining_secs > 0 {
-        format!(
-            "{}: rate limited, retrying in {}s",
-            cooldown.provider, cooldown.remaining_secs
-        )
+        gettext(locale, "{provider}: rate limited, retrying in {seconds}s")
+            .replace("{provider}", &cooldown.provider)
+            .replace("{seconds}", &cooldown.remaining_secs.to_string())
     } else if !cooldown.message.trim().is_empty() {
-        format!("{}: {}", cooldown.provider, cooldown.message.trim())
+        gettext(locale, "{provider}: {message}")
+            .replace("{provider}", &cooldown.provider)
+            .replace("{message}", cooldown.message.trim())
     } else {
-        format!("{}: rate limited, retrying soon", cooldown.provider)
+        gettext(locale, "{provider}: rate limited, retrying soon")
+            .replace("{provider}", &cooldown.provider)
     }
 }
 
-fn status_label(status: SyncStatus) -> &'static str {
+fn status_label(locale: Locale, status: SyncStatus) -> Cow<'static, str> {
     match status {
-        SyncStatus::Done => "Synced",
-        SyncStatus::Downloading => "Downloading",
-        SyncStatus::Resolving => "Resolving",
-        SyncStatus::Pending => "Pending",
-        SyncStatus::Unmatched => "Unmatched",
-        SyncStatus::Failed => "Failed",
+        SyncStatus::Done => gettext(locale, "Synced"),
+        SyncStatus::Downloading => gettext(locale, "Downloading"),
+        SyncStatus::Resolving => gettext(locale, "Resolving"),
+        SyncStatus::Pending => gettext(locale, "Pending"),
+        SyncStatus::Unmatched => gettext(locale, "Unmatched"),
+        SyncStatus::Failed => gettext(locale, "Failed"),
     }
 }
 
@@ -123,46 +126,59 @@ fn status_sort_rank(status: SyncStatus) -> u8 {
     }
 }
 
-fn status_tooltip(info: &TrackSyncInfo) -> String {
+fn status_tooltip(locale: Locale, info: &TrackSyncInfo) -> String {
     let mut lines = Vec::with_capacity(4);
-    lines.push(format!("Sync status: {}", status_label(info.status)));
+    lines.push(
+        gettext(locale, "Sync status: {status}")
+            .replace("{status}", &status_label(locale, info.status)),
+    );
     if let Some(quality) = info.quality.as_deref().filter(|q| !q.is_empty()) {
-        lines.push(format!("Quality: {}", format_quality_badge(quality)));
+        lines.push(
+            gettext(locale, "Quality: {quality}")
+                .replace("{quality}", &format_quality_badge(quality)),
+        );
     }
     if let Some(provider) = info.provider.as_deref().filter(|p| !p.is_empty()) {
         let matched = info
             .matched_by
             .as_deref()
             .filter(|m| !m.is_empty())
-            .map(|m| format!(" (matched by {m})"))
+            .map(|m| gettext(locale, " (matched by {matched})").replace("{matched}", m))
             .unwrap_or_default();
-        lines.push(format!(
-            "Provider: {}{matched}",
-            provider_display_name(provider)
-        ));
+        lines.push(
+            gettext(locale, "Provider: {provider}{matched}")
+                .replace("{provider}", &provider_display_name(provider))
+                .replace("{matched}", &matched),
+        );
     } else if let Some(matched) = info.matched_by.as_deref().filter(|m| !m.is_empty()) {
-        lines.push(format!("Matched by: {matched}"));
+        lines.push(gettext(locale, "Matched by: {matched}").replace("{matched}", matched));
     }
     if let Some(err) = info.error.as_deref().filter(|e| !e.is_empty()) {
-        lines.push(format!("Error: {err}"));
+        lines.push(gettext(locale, "Error: {error}").replace("{error}", err));
     }
     lines.join("\n")
 }
 
 /// Paints a crisp 7.5pt sync status indicator dot with a hover tooltip.
+///
+/// The dot is shared by every track row, and those callers do not pass the
+/// interface locale, so its tooltip and screen-reader label stay in English.
 pub(crate) fn track_status_dot(ui: &mut Ui, palette: &Palette, info: &TrackSyncInfo) {
     let (rect, response) = ui.allocate_exact_size(vec2(10.0, 14.0), Sense::hover());
     if ui.is_rect_visible(rect) {
         paint_status_dot(ui.painter(), rect.center(), palette, info.status);
     }
-    let a11y_label = format!("Sync status: {}", status_label(info.status));
+    let a11y_label = format!(
+        "Sync status: {}",
+        status_label(Locale::English, info.status)
+    );
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Label, true, a11y_label.clone())
     });
     ui.ctx()
         .accesskit_node_builder(response.id, |node| node.set_label(a11y_label));
     if response.hovered() {
-        response.on_hover_text(status_tooltip(info));
+        response.on_hover_text(status_tooltip(Locale::English, info));
     }
 }
 
@@ -211,6 +227,18 @@ pub(crate) fn playlist_menu_item(ui: &mut Ui, app: &mut App, uri: &str, name: &s
     }
 }
 
+/// Icon for the synced playlist header pill. Work still in progress shows a
+/// spinner, and a failed track never gets the finished check mark.
+fn playlist_pill_icon(counts: &PlaylistCounts) -> Icon {
+    if counts.pending + counts.resolving + counts.downloading > 0 {
+        Icon::Refresh
+    } else if counts.failed > 0 {
+        Icon::CircleAlert
+    } else {
+        Icon::CircleCheck
+    }
+}
+
 /// Compact synced status pill rendered in a synced playlist's header action row.
 pub(crate) fn playlist_sync_pill(app: &mut App, ui: &mut Ui, playlist_uri: &str) {
     if util::uri_kind(playlist_uri) != Some("playlist") {
@@ -223,35 +251,38 @@ pub(crate) fn playlist_sync_pill(app: &mut App, ui: &mut Ui, playlist_uri: &str)
         return;
     }
     let palette = app.palette;
+    let locale = app.locale;
     let counts = app.sync_state.playlist_counts.get(playlist_id);
     let (label, icon, tooltip) = match counts {
         Some(c) => {
             let total = counts_total(c);
-            let active = c.pending + c.resolving + c.downloading;
             let text = if total > 0 {
-                format!("Synced ({}/{total})", c.done)
+                gettext(locale, "Synced ({done}/{total})")
+                    .replace("{done}", &c.done.to_string())
+                    .replace("{total}", &total.to_string())
             } else {
-                "Synced".to_string()
+                gettext(locale, "Synced").into_owned()
             };
-            let icon = if active > 0 {
-                Icon::Refresh
-            } else {
-                Icon::CircleCheck
-            };
-            let tip = format!(
-                "Done: {}, Active: {}, Pending: {}, Unmatched: {}, Failed: {}. Click to open Sync Queue.",
-                c.done,
-                c.resolving + c.downloading,
-                c.pending,
-                c.unmatched,
-                c.failed
-            );
+            let icon = playlist_pill_icon(c);
+            let tip = gettext(
+                locale,
+                "Done: {done}, Active: {active}, Pending: {pending}, Unmatched: {unmatched}, Failed: {failed}. Click to open Sync Queue.",
+            )
+            .replace("{done}", &c.done.to_string())
+            .replace("{active}", &(c.resolving + c.downloading).to_string())
+            .replace("{pending}", &c.pending.to_string())
+            .replace("{unmatched}", &c.unmatched.to_string())
+            .replace("{failed}", &c.failed.to_string());
             (text, icon, tip)
         }
         None => (
-            "Synced".to_string(),
+            gettext(locale, "Synced").into_owned(),
             Icon::CircleCheck,
-            "Lossless playlist sync is enabled. Click to open Sync Queue.".to_string(),
+            gettext(
+                locale,
+                "Lossless playlist sync is enabled. Click to open Sync Queue.",
+            )
+            .into_owned(),
         ),
     };
     let response = theme::soft_button(ui, &palette, Some(icon), &label, false);
@@ -480,21 +511,32 @@ fn merged_synced_playlists(app: &App) -> Vec<SyncedPlaylist> {
     list
 }
 
-fn credential_status_display(palette: &Palette, status: &CredentialStatus) -> (Color32, String) {
+fn credential_status_display(
+    palette: &Palette,
+    locale: Locale,
+    status: &CredentialStatus,
+) -> (Color32, String) {
     match status {
         CredentialStatus::Valid { detail, .. } => {
             let text = if detail.trim().is_empty() {
-                "Valid".to_string()
+                gettext(locale, "Valid").into_owned()
             } else {
-                format!("Valid ({detail})")
+                gettext(locale, "Valid ({detail})").replace("{detail}", detail)
             };
             (palette.accent, text)
         }
-        CredentialStatus::Validating => (palette.warning, "Validating...".to_string()),
-        CredentialStatus::Invalid { message, .. } => {
-            (palette.danger, format!("Invalid: {message}"))
-        }
-        CredentialStatus::Missing => (palette.secondary, "Not configured".to_string()),
+        CredentialStatus::Validating => (
+            palette.warning,
+            gettext(locale, "Validating...").into_owned(),
+        ),
+        CredentialStatus::Invalid { message, .. } => (
+            palette.danger,
+            gettext(locale, "Invalid: {message}").replace("{message}", message),
+        ),
+        CredentialStatus::Missing => (
+            palette.secondary,
+            gettext(locale, "Not configured").into_owned(),
+        ),
     }
 }
 
@@ -510,9 +552,10 @@ pub fn settings_section(app: &mut App, ui: &mut Ui, needle: &str) -> bool {
     let root_description = if has_custom_root {
         resolved_root.display().to_string()
     } else {
-        format!("Default: {}", resolved_root.display())
+        gettext(locale, "Default: {path}").replace("{path}", &resolved_root.display().to_string())
     };
-    let (_, cred_text) = credential_status_display(&palette, &app.sync_state.qobuz_credentials);
+    let (_, cred_text) =
+        credential_status_display(&palette, locale, &app.sync_state.qobuz_credentials);
     let rows = [
         RowText::new(gettext(locale, "Library root"), root_description),
         RowText::new(
@@ -524,7 +567,11 @@ pub fn settings_section(app: &mut App, ui: &mut Ui, needle: &str) -> bool {
         ),
         RowText::new(
             gettext(locale, "Qobuz credentials"),
-            format!("Status: {cred_text}. Saved tokens are stored securely and never shown again."),
+            gettext(
+                locale,
+                "Status: {status}. Saved tokens are stored securely and never shown again.",
+            )
+            .replace("{status}", &cred_text),
         ),
         RowText::new(
             gettext(locale, "Quality ceiling"),
@@ -599,7 +646,7 @@ pub fn settings_section(app: &mut App, ui: &mut Ui, needle: &str) -> bool {
             let providers = app.settings.sync.providers.clone();
             let multiple = providers.len() > 1;
             if providers.is_empty() {
-                theme::subtle(ui, &palette, "No providers configured.");
+                theme::subtle(ui, &palette, &gettext(locale, "No providers configured."));
             } else {
                 for (index, provider) in providers.iter().enumerate() {
                     ui.push_id(("sync-provider", &provider.id), |ui| {
@@ -625,9 +672,9 @@ pub fn settings_section(app: &mut App, ui: &mut Ui, needle: &str) -> bool {
                                     );
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                         let mut enabled = provider.enabled;
-                                        let label = format!(
-                                            "Enable {}",
-                                            provider_display_name(&provider.id)
+                                        let label = gettext(locale, "Enable {provider}").replace(
+                                            "{provider}",
+                                            &provider_display_name(&provider.id),
                                         );
                                         if widgets::switch(ui, &palette, &label, &mut enabled)
                                             .changed()
@@ -647,7 +694,7 @@ pub fn settings_section(app: &mut App, ui: &mut Ui, needle: &str) -> bool {
                                                         16.0,
                                                         palette.secondary,
                                                         palette.text,
-                                                        "Move down",
+                                                        &gettext(locale, "Move down"),
                                                     )
                                                 })
                                                 .inner
@@ -667,7 +714,7 @@ pub fn settings_section(app: &mut App, ui: &mut Ui, needle: &str) -> bool {
                                                         16.0,
                                                         palette.secondary,
                                                         palette.text,
-                                                        "Move up",
+                                                        &gettext(locale, "Move up"),
                                                     )
                                                 })
                                                 .inner
@@ -692,7 +739,7 @@ pub fn settings_section(app: &mut App, ui: &mut Ui, needle: &str) -> bool {
         // 3. Qobuz credentials
         if rows[2].matches(rows_needle, &title) {
             let (status_color, status_text) =
-                credential_status_display(&palette, &app.sync_state.qobuz_credentials);
+                credential_status_display(&palette, locale, &app.sync_state.qobuz_credentials);
             filtered_row(ui, &palette, rows_needle, &title, &rows[2], |ui| {
                 status_pill(ui, &palette, status_color, &status_text);
             });
@@ -704,20 +751,21 @@ pub fn settings_section(app: &mut App, ui: &mut Ui, needle: &str) -> bool {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     let field_width = ui.available_width().clamp(160.0, 360.0);
+                    let app_id_label = gettext(locale, "App ID");
                     let app_id_hint = app
                         .sync_state
                         .qobuz_app_id_hint
                         .as_deref()
                         .filter(|h| !h.is_empty())
-                        .map(|h| format!("Saved App ID: {h}"))
-                        .unwrap_or_else(|| "App ID".to_string());
+                        .map(|h| gettext(locale, "Saved App ID: {app_id}").replace("{app_id}", h))
+                        .unwrap_or_else(|| app_id_label.to_string());
 
                     credential_field(
                         ui,
                         &palette,
                         locale,
                         "sync-qobuz-app-id",
-                        "App ID",
+                        &app_id_label,
                         &app_id_hint,
                         &mut app.sync_qobuz_app_id_input,
                         false,
@@ -729,8 +777,8 @@ pub fn settings_section(app: &mut App, ui: &mut Ui, needle: &str) -> bool {
                         &palette,
                         locale,
                         "sync-qobuz-token",
-                        "User Auth Token",
-                        "Enter User Auth Token",
+                        &gettext(locale, "User Auth Token"),
+                        &gettext(locale, "Enter User Auth Token"),
                         &mut app.sync_qobuz_token_input,
                         true,
                         field_width,
@@ -741,8 +789,8 @@ pub fn settings_section(app: &mut App, ui: &mut Ui, needle: &str) -> bool {
                         &palette,
                         locale,
                         "sync-qobuz-secret",
-                        "App Secret (optional)",
-                        "Optional App Secret",
+                        &gettext(locale, "App Secret (optional)"),
+                        &gettext(locale, "Optional App Secret"),
                         &mut app.sync_qobuz_secret_input,
                         true,
                         field_width,
@@ -774,7 +822,12 @@ pub fn settings_section(app: &mut App, ui: &mut Ui, needle: &str) -> bool {
                         ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
                         let save_clicked = ui
                             .add_enabled_ui(can_save, |ui| {
-                                theme::pill_button(ui, &palette, "Save & validate", true)
+                                theme::pill_button(
+                                    ui,
+                                    &palette,
+                                    &gettext(locale, "Save & validate"),
+                                    true,
+                                )
                             })
                             .inner
                             .clicked();
@@ -792,7 +845,7 @@ pub fn settings_section(app: &mut App, ui: &mut Ui, needle: &str) -> bool {
                                     ui,
                                     &palette,
                                     Some(Icon::Check),
-                                    "Validate",
+                                    &gettext(locale, "Validate"),
                                     false,
                                 )
                             })
@@ -803,7 +856,13 @@ pub fn settings_section(app: &mut App, ui: &mut Ui, needle: &str) -> bool {
                         }
                         let clear_clicked = ui
                             .add_enabled_ui(can_clear, |ui| {
-                                theme::soft_button(ui, &palette, Some(Icon::Trash), "Clear", false)
+                                theme::soft_button(
+                                    ui,
+                                    &palette,
+                                    Some(Icon::Trash),
+                                    &gettext(locale, "Clear"),
+                                    false,
+                                )
                             })
                             .inner
                             .clicked();
@@ -855,8 +914,14 @@ pub fn settings_section(app: &mut App, ui: &mut Ui, needle: &str) -> bool {
         // 6. Synced playlists table
         if rows[5].matches(rows_needle, &title) {
             filtered_row(ui, &palette, rows_needle, &title, &rows[5], |ui| {
-                if theme::soft_button(ui, &palette, Some(Icon::Refresh), "Sync now", false)
-                    .clicked()
+                if theme::soft_button(
+                    ui,
+                    &palette,
+                    Some(Icon::Refresh),
+                    &gettext(locale, "Sync now"),
+                    false,
+                )
+                .clicked()
                 {
                     app.actions.push(Action::SyncTriggerNow);
                 }
@@ -866,7 +931,10 @@ pub fn settings_section(app: &mut App, ui: &mut Ui, needle: &str) -> bool {
                 theme::subtle(
                     ui,
                     &palette,
-                    "No playlists synced yet. Open any playlist menu and choose \"Sync this playlist\".",
+                    &gettext(
+                        locale,
+                        "No playlists synced yet. Open any playlist menu and choose \"Sync this playlist\".",
+                    ),
                 );
                 ui.add_space(8.0);
             } else {
@@ -901,11 +969,11 @@ pub fn settings_section(app: &mut App, ui: &mut Ui, needle: &str) -> bool {
                                     }
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                         let label = if playlist.enabled {
-                                            "Stop syncing"
+                                            gettext(locale, "Stop syncing")
                                         } else {
-                                            "Resume syncing"
+                                            gettext(locale, "Resume syncing")
                                         };
-                                        if theme::soft_button(ui, &palette, None, label, false)
+                                        if theme::soft_button(ui, &palette, None, &label, false)
                                             .clicked()
                                         {
                                             app.actions.push(Action::TogglePlaylistSync {
@@ -924,29 +992,35 @@ pub fn settings_section(app: &mut App, ui: &mut Ui, needle: &str) -> bool {
                                         ui,
                                         &palette,
                                         SyncStatus::Pending,
-                                        "Pending",
+                                        &gettext(locale, "Pending"),
                                         counts.pending,
                                     );
                                     count_chip(
                                         ui,
                                         &palette,
                                         SyncStatus::Downloading,
-                                        "Active",
+                                        &gettext(locale, "Active"),
                                         active,
                                     );
-                                    count_chip(ui, &palette, SyncStatus::Done, "Done", counts.done);
+                                    count_chip(
+                                        ui,
+                                        &palette,
+                                        SyncStatus::Done,
+                                        &gettext(locale, "Done"),
+                                        counts.done,
+                                    );
                                     count_chip(
                                         ui,
                                         &palette,
                                         SyncStatus::Unmatched,
-                                        "Unmatched",
+                                        &gettext(locale, "Unmatched"),
                                         counts.unmatched,
                                     );
                                     count_chip(
                                         ui,
                                         &palette,
                                         SyncStatus::Failed,
-                                        "Failed",
+                                        &gettext(locale, "Failed"),
                                         counts.failed,
                                     );
                                 });
@@ -1085,7 +1159,10 @@ fn collect_queue_rows(app: &App, filter: QueueFilter) -> Vec<QueueRowEntry> {
         } else if let Some(lib) = library_lookup.get(&(playlist_id.as_str(), track_id.as_str())) {
             (lib.title.clone(), lib.artists.clone())
         } else {
-            (format!("Track {track_id}"), String::new())
+            (
+                gettext(app.locale, "Track {track}").replace("{track}", track_id),
+                String::new(),
+            )
         };
         let playlist_name = playlist_names
             .get(playlist_id.as_str())
@@ -1113,8 +1190,9 @@ fn collect_queue_rows(app: &App, filter: QueueFilter) -> Vec<QueueRowEntry> {
 
 fn cooldown_banners(app: &App, ui: &mut Ui) {
     let palette = app.palette;
+    let locale = app.locale;
     for cooldown in app.sync_state.snapshot.cooldowns.values() {
-        let message = format_cooldown_banner(cooldown);
+        let message = format_cooldown_banner(locale, cooldown);
         let fill = super::blend(palette.panel, palette.warning, 0.16);
         Frame::new()
             .fill(fill)
@@ -1157,6 +1235,7 @@ fn cooldown_banners(app: &App, ui: &mut Ui) {
 
 fn progress_summary(app: &App, ui: &mut Ui, compact: bool) {
     let palette = app.palette;
+    let locale = app.locale;
     let snap = &app.sync_state.snapshot;
     let total =
         snap.pending + snap.resolving + snap.downloading + snap.done + snap.unmatched + snap.failed;
@@ -1187,9 +1266,11 @@ fn progress_summary(app: &App, ui: &mut Ui, compact: bool) {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 let headline = if total == 0 {
-                    "Idle".to_string()
+                    gettext(locale, "Idle").into_owned()
                 } else {
-                    format!("{} of {} synced", snap.done, total)
+                    gettext(locale, "{done} of {total} synced")
+                        .replace("{done}", &snap.done.to_string())
+                        .replace("{total}", &total.to_string())
                 };
                 theme::text(
                     ui,
@@ -1265,20 +1346,39 @@ fn progress_summary(app: &App, ui: &mut Ui, compact: bool) {
 /// Full-page Sync Queue view (`Page::SyncQueue`).
 pub fn queue_view(app: &mut App, ui: &mut Ui) {
     let palette = app.palette;
+    let locale = app.locale;
     ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
-        theme::text(ui, "Sync Queue", theme::bold(28.0), palette.text);
+        theme::text(
+            ui,
+            gettext(locale, "Sync Queue"),
+            theme::bold(28.0),
+            palette.text,
+        );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            if theme::pill_button(ui, &palette, "Sync now", true).clicked() {
+            if theme::pill_button(ui, &palette, &gettext(locale, "Sync now"), true).clicked() {
                 app.actions.push(Action::SyncTriggerNow);
             }
-            if theme::soft_button(ui, &palette, Some(Icon::Disc), "Synced Library", false).clicked()
+            if theme::soft_button(
+                ui,
+                &palette,
+                Some(Icon::Disc),
+                &gettext(locale, "Synced Library"),
+                false,
+            )
+            .clicked()
             {
                 app.actions.push(Action::Open(Page::SyncedLibrary));
             }
-            if theme::soft_button(ui, &palette, Some(Icon::Settings), "Sync settings", false)
-                .clicked()
+            if theme::soft_button(
+                ui,
+                &palette,
+                Some(Icon::Settings),
+                &gettext(locale, "Sync settings"),
+                false,
+            )
+            .clicked()
             {
                 app.actions.push(Action::Open(Page::Settings));
             }
@@ -1294,16 +1394,24 @@ pub fn queue_view(app: &mut App, ui: &mut Ui) {
     let mut filter = ui
         .data(|d| d.get_temp::<QueueFilter>(filter_id))
         .unwrap_or_default();
+    let filter_labels = [
+        gettext(locale, "All"),
+        gettext(locale, "Active"),
+        gettext(locale, "Pending"),
+        gettext(locale, "Done"),
+        gettext(locale, "Unmatched"),
+        gettext(locale, "Failed"),
+    ];
     if let Some(picked) = widgets::chips(
         ui,
         &palette,
         &[
-            (QueueFilter::All, "All"),
-            (QueueFilter::Active, "Active"),
-            (QueueFilter::Pending, "Pending"),
-            (QueueFilter::Done, "Done"),
-            (QueueFilter::Unmatched, "Unmatched"),
-            (QueueFilter::Failed, "Failed"),
+            (QueueFilter::All, &*filter_labels[0]),
+            (QueueFilter::Active, &*filter_labels[1]),
+            (QueueFilter::Pending, &*filter_labels[2]),
+            (QueueFilter::Done, &*filter_labels[3]),
+            (QueueFilter::Unmatched, &*filter_labels[4]),
+            (QueueFilter::Failed, &*filter_labels[5]),
         ],
         filter,
     ) {
@@ -1316,16 +1424,22 @@ pub fn queue_view(app: &mut App, ui: &mut Ui) {
     if rows.is_empty() {
         let (heading, body) = if app.sync_state.track_statuses.is_empty() {
             (
-                "No synced tracks yet",
-                "Enable sync on any playlist from its menu to queue lossless downloads.",
+                gettext(locale, "No synced tracks yet"),
+                gettext(
+                    locale,
+                    "Enable sync on any playlist from its menu to queue lossless downloads.",
+                ),
             )
         } else {
             (
-                "No matching items",
-                "Try another status filter to see the rest of the sync queue.",
+                gettext(locale, "No matching items"),
+                gettext(
+                    locale,
+                    "Try another status filter to see the rest of the sync queue.",
+                ),
             )
         };
-        widgets::empty_state(ui, &palette, Icon::Refresh, heading, body);
+        widgets::empty_state(ui, &palette, Icon::Refresh, &heading, &body);
         return;
     }
 
@@ -1339,12 +1453,29 @@ pub fn queue_view(app: &mut App, ui: &mut Ui) {
 /// Compact Sync Queue tab inside the right-hand Queue side panel (`QueueTab::Sync`).
 pub fn queue_panel(app: &mut App, ui: &mut Ui) {
     let palette = app.palette;
+    let locale = app.locale;
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
-        if theme::soft_button(ui, &palette, Some(Icon::Refresh), "Sync now", false).clicked() {
+        if theme::soft_button(
+            ui,
+            &palette,
+            Some(Icon::Refresh),
+            &gettext(locale, "Sync now"),
+            false,
+        )
+        .clicked()
+        {
             app.actions.push(Action::SyncTriggerNow);
         }
-        if theme::soft_button(ui, &palette, Some(Icon::Expand), "Full view", false).clicked() {
+        if theme::soft_button(
+            ui,
+            &palette,
+            Some(Icon::Expand),
+            &gettext(locale, "Full view"),
+            false,
+        )
+        .clicked()
+        {
             app.actions.push(Action::Open(Page::SyncQueue));
         }
     });
@@ -1359,7 +1490,10 @@ pub fn queue_panel(app: &mut App, ui: &mut Ui) {
         theme::subtle(
             ui,
             &palette,
-            "No tracks queued for sync. Use a playlist's menu to start syncing.",
+            &gettext(
+                locale,
+                "No tracks queued for sync. Use a playlist's menu to start syncing.",
+            ),
         );
         return;
     }
@@ -1373,6 +1507,7 @@ pub fn queue_panel(app: &mut App, ui: &mut Ui) {
 
 fn queue_item_row(app: &mut App, ui: &mut Ui, entry: &QueueRowEntry, height: f32, compact: bool) {
     let palette = app.palette;
+    let locale = app.locale;
     let width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
     if !ui.is_rect_visible(rect) {
@@ -1451,12 +1586,12 @@ fn queue_item_row(app: &mut App, ui: &mut Ui, entry: &QueueRowEntry, height: f32
                 format!("{} · {err}", parts.join(" · "))
             }
         } else if parts.is_empty() {
-            status_label(entry.info.status).to_string()
+            status_label(locale, entry.info.status).into_owned()
         } else {
             format!(
                 "{} · {}",
                 parts.join(" · "),
-                status_label(entry.info.status)
+                status_label(locale, entry.info.status)
             )
         };
         let meta_color = match entry.info.status {
@@ -1487,7 +1622,7 @@ fn queue_item_row(app: &mut App, ui: &mut Ui, entry: &QueueRowEntry, height: f32
                         16.0,
                         palette.secondary,
                         palette.text,
-                        "Retry sync",
+                        &gettext(locale, "Retry sync"),
                     )
                     .clicked()
                 } else {
@@ -1495,7 +1630,7 @@ fn queue_item_row(app: &mut App, ui: &mut Ui, entry: &QueueRowEntry, height: f32
                         &mut action_ui,
                         &palette,
                         Some(Icon::Refresh),
-                        "Retry",
+                        &gettext(locale, "Retry"),
                         false,
                     )
                     .clicked()
@@ -1515,7 +1650,7 @@ fn queue_item_row(app: &mut App, ui: &mut Ui, entry: &QueueRowEntry, height: f32
                         16.0,
                         palette.secondary,
                         palette.text,
-                        "Open synced folder",
+                        &gettext(locale, "Open synced folder"),
                     )
                     .clicked()
                     {
@@ -1528,7 +1663,7 @@ fn queue_item_row(app: &mut App, ui: &mut Ui, entry: &QueueRowEntry, height: f32
                             16.0,
                             palette.accent,
                             palette.accent_hover,
-                            "Play lossless copy",
+                            &gettext(locale, "Play lossless copy"),
                         )
                         .clicked()
                     {
@@ -1563,7 +1698,7 @@ fn queue_item_row(app: &mut App, ui: &mut Ui, entry: &QueueRowEntry, height: f32
     }
 
     if response.hovered() {
-        response.on_hover_text(status_tooltip(&entry.info));
+        response.on_hover_text(status_tooltip(locale, &entry.info));
     }
 }
 
@@ -1616,12 +1751,20 @@ pub fn library_view(app: &mut App, ui: &mut Ui) {
     ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
         ui.vertical(|ui| {
-            theme::text(ui, "Synced Library", theme::bold(28.0), palette.text);
-            let count_text = if total_count == 1 {
-                "1 lossless track".to_string()
-            } else {
-                format!("{total_count} lossless tracks")
-            };
+            theme::text(
+                ui,
+                gettext(locale, "Synced Library"),
+                theme::bold(28.0),
+                palette.text,
+            );
+            // Translators: {count} is the number of lossless tracks in the library.
+            let count_text = ngettext(
+                locale,
+                "{count} lossless track",
+                "{count} lossless tracks",
+                u32::try_from(total_count).unwrap_or(u32::MAX),
+            )
+            .replace("{count}", &total_count.to_string());
             let root = app.settings.resolved_sync_root(&app.dirs);
             theme::text(
                 ui,
@@ -1637,7 +1780,7 @@ pub fn library_view(app: &mut App, ui: &mut Ui) {
         ui.spacing_mut().item_spacing = vec2(10.0, 6.0);
         let play_all_clicked = ui
             .add_enabled_ui(!filtered_indices.is_empty(), |ui| {
-                theme::pill_button(ui, &palette, "Play all", true)
+                theme::pill_button(ui, &palette, &gettext(locale, "Play all"), true)
             })
             .inner
             .clicked();
@@ -1654,13 +1797,34 @@ pub fn library_view(app: &mut App, ui: &mut Ui) {
                 });
             }
         }
-        if theme::soft_button(ui, &palette, Some(Icon::ExternalLink), "Open folder", false)
-            .clicked()
-        {
+        // Until the library has a track there is no folder to show: the root
+        // is only created by a download. Opening a missing root would open its
+        // parent instead, so the button stays disabled.
+        let open_folder_clicked = ui
+            .add_enabled_ui(total_count > 0, |ui| {
+                theme::soft_button(
+                    ui,
+                    &palette,
+                    Some(Icon::ExternalLink),
+                    &gettext(locale, "Open folder"),
+                    false,
+                )
+            })
+            .inner
+            .clicked();
+        if open_folder_clicked {
             let root = app.settings.resolved_sync_root(&app.dirs);
             app.actions.push(Action::SyncOpenTrackFolder(root));
         }
-        if theme::soft_button(ui, &palette, Some(Icon::Refresh), "Sync Queue", false).clicked() {
+        if theme::soft_button(
+            ui,
+            &palette,
+            Some(Icon::Refresh),
+            &gettext(locale, "Sync Queue"),
+            false,
+        )
+        .clicked()
+        {
             app.actions.push(Action::Open(Page::SyncQueue));
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1670,7 +1834,7 @@ pub fn library_view(app: &mut App, ui: &mut Ui) {
                 locale,
                 egui::Id::new("synced-library-search-field"),
                 &mut filter,
-                "Filter lossless library",
+                &gettext(locale, "Filter lossless library"),
                 ui.available_width().clamp(160.0, 260.0),
             );
         });
@@ -1683,12 +1847,17 @@ pub fn library_view(app: &mut App, ui: &mut Ui) {
             ui,
             &palette,
             Icon::Disc,
-            "No lossless tracks downloaded yet",
-            "Sync a playlist from its menu and configure a lossless provider in Settings to build your local FLAC library.",
+            &gettext(locale, "No lossless tracks downloaded yet"),
+            &gettext(
+                locale,
+                "Sync a playlist from its menu and configure a lossless provider in Settings to build your local FLAC library.",
+            ),
         );
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            if theme::pill_button(ui, &palette, "Open Sync settings", true).clicked() {
+            if theme::pill_button(ui, &palette, &gettext(locale, "Open Sync settings"), true)
+                .clicked()
+            {
                 app.actions.push(Action::Open(Page::Settings));
             }
         });
@@ -1700,8 +1869,11 @@ pub fn library_view(app: &mut App, ui: &mut Ui) {
             ui,
             &palette,
             Icon::Search,
-            "No matching lossless tracks",
-            "Clear or adjust the filter to see all downloaded tracks.",
+            &gettext(locale, "No matching lossless tracks"),
+            &gettext(
+                locale,
+                "Clear or adjust the filter to see all downloaded tracks.",
+            ),
         );
         return;
     }
@@ -1711,7 +1883,7 @@ pub fn library_view(app: &mut App, ui: &mut Ui) {
     let show_album = width > 620.0;
     let show_provider = width > 780.0;
     let cols = LibraryColumns::for_width(width, show_album, show_provider);
-    library_header(ui, &palette, cols);
+    library_header(ui, &palette, locale, cols);
 
     let playing_path = app
         .local_flac
@@ -1770,7 +1942,7 @@ impl LibraryColumns {
     }
 }
 
-fn library_header(ui: &mut Ui, palette: &Palette, cols: LibraryColumns) {
+fn library_header(ui: &mut Ui, palette: &Palette, locale: Locale, cols: LibraryColumns) {
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(vec2(width, 28.0), Sense::hover());
     let painter = ui.painter();
@@ -1793,7 +1965,7 @@ fn library_header(ui: &mut Ui, palette: &Palette, cols: LibraryColumns) {
     painter.text(
         pos2(x, cy),
         egui::Align2::LEFT_CENTER,
-        "Title",
+        gettext(locale, "Title"),
         font.clone(),
         color,
     );
@@ -1803,7 +1975,7 @@ fn library_header(ui: &mut Ui, palette: &Palette, cols: LibraryColumns) {
         painter.text(
             pos2(x, cy),
             egui::Align2::LEFT_CENTER,
-            "Album",
+            gettext(locale, "Album"),
             font.clone(),
             color,
         );
@@ -1812,7 +1984,7 @@ fn library_header(ui: &mut Ui, palette: &Palette, cols: LibraryColumns) {
     painter.text(
         pos2(x, cy),
         egui::Align2::LEFT_CENTER,
-        "Quality",
+        gettext(locale, "Quality"),
         font.clone(),
         color,
     );
@@ -1821,7 +1993,7 @@ fn library_header(ui: &mut Ui, palette: &Palette, cols: LibraryColumns) {
         painter.text(
             pos2(x, cy),
             egui::Align2::LEFT_CENTER,
-            "Provider",
+            gettext(locale, "Provider"),
             font.clone(),
             color,
         );
@@ -1830,7 +2002,7 @@ fn library_header(ui: &mut Ui, palette: &Palette, cols: LibraryColumns) {
     painter.text(
         pos2(x + cols.duration - 6.0, cy),
         egui::Align2::RIGHT_CENTER,
-        "Time",
+        gettext(locale, "Time"),
         font,
         color,
     );
@@ -1840,6 +2012,32 @@ fn library_header(ui: &mut Ui, palette: &Palette, cols: LibraryColumns) {
         Stroke::new(1.0, palette.outline),
     );
     ui.add_space(4.0);
+}
+
+/// Identity of a lossless library row: the playlist and track it came from,
+/// and the file it plays. Deliberately not the row's position in the list.
+fn library_row_key(track: &SyncedLibraryTrack) -> (&'static str, &str, &str, &std::path::Path) {
+    (
+        "synced-library-row",
+        track.playlist_id.as_str(),
+        track.track_id.as_str(),
+        track.path.as_path(),
+    )
+}
+
+/// Whether a library row interaction plays its track this frame.
+///
+/// egui reports a double click as two presses: the first is a plain click and
+/// the second is both a click and a double click. A plain click acts only on
+/// the number column (the play control), and a double click acts only on the
+/// rest of the row, so one gesture queues one action.
+fn library_row_activation(
+    plain_click: bool,
+    double_click: bool,
+    on_play_control: bool,
+    accessible_click: bool,
+) -> bool {
+    (plain_click && on_play_control) || (double_click && !on_play_control) || accessible_click
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1856,14 +2054,21 @@ fn library_track_row(
     all_tracks: &[SyncedLibraryTrack],
 ) {
     let palette = app.palette;
+    let locale = app.locale;
     let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(vec2(width, row_height), Sense::click());
+    // The row is keyed by its track rather than its list position, so hover,
+    // focus and an open context menu stay with the track when the list changes.
+    let (_, rect) = ui.allocate_space(vec2(width, row_height));
+    let response = ui.interact(rect, egui::Id::new(library_row_key(track)), Sense::click());
+    let row_label = gettext(locale, "Play {title}, {artists}")
+        .replace("{title}", &track.title)
+        .replace("{artists}", &track.artists);
     response.widget_info(|| {
         egui::WidgetInfo::selected(
             egui::WidgetType::Button,
             true,
             is_current,
-            format!("Play {}, {}", track.title, track.artists),
+            row_label.clone(),
         )
     });
     if !ui.is_rect_visible(rect) && !response.has_focus() && !response.clicked() {
@@ -1996,7 +2201,7 @@ fn library_track_row(
             .provider
             .as_deref()
             .map(provider_display_name)
-            .unwrap_or_else(|| "Local".to_string());
+            .unwrap_or_else(|| gettext(locale, "Local").into_owned());
         painter.text(
             pos2(x, rect.center().y),
             egui::Align2::LEFT_CENTER,
@@ -2035,7 +2240,7 @@ fn library_track_row(
         16.0,
         palette.secondary,
         palette.text,
-        "Open synced folder",
+        &gettext(locale, "Open synced folder"),
     )
     .clicked();
     if open_folder_clicked {
@@ -2059,10 +2264,15 @@ fn library_track_row(
         .interact_pointer_pos()
         .is_some_and(|pos| num_rect.contains(pos));
     let accessible_click = response.clicked() && response.interact_pointer_pos().is_none();
+    let plain_click =
+        response.clicked() && !response.double_clicked() && !response.triple_clicked();
     if !open_folder_clicked
-        && (response.double_clicked()
-            || accessible_click
-            || (response.clicked() && on_play_control))
+        && library_row_activation(
+            plain_click,
+            response.double_clicked(),
+            on_play_control,
+            accessible_click,
+        )
     {
         if is_current && on_play_control {
             app.actions.push(Action::LocalFlacPlayPause);
@@ -2075,18 +2285,147 @@ fn library_track_row(
         .frame(widgets::menu_frame(&palette))
         .show(|ui| {
             ui.set_min_width(200.0);
-            if widgets::menu_item(ui, &palette, Some(Icon::Play), "Play lossless copy") {
+            if widgets::menu_item(
+                ui,
+                &palette,
+                Some(Icon::Play),
+                &gettext(locale, "Play lossless copy"),
+            ) {
                 app.actions.push(build_play_action());
             }
-            if widgets::menu_item(ui, &palette, Some(Icon::ExternalLink), "Open synced folder") {
+            if widgets::menu_item(
+                ui,
+                &palette,
+                Some(Icon::ExternalLink),
+                &gettext(locale, "Open synced folder"),
+            ) {
                 app.actions
                     .push(Action::SyncOpenTrackFolder(track.path.clone()));
             }
             if !track.playlist_id.is_empty()
-                && widgets::menu_item(ui, &palette, Some(Icon::ListMusic), "Go to playlist")
+                && widgets::menu_item(
+                    ui,
+                    &palette,
+                    Some(Icon::ListMusic),
+                    &gettext(locale, "Go to playlist"),
+                )
             {
                 app.actions
                     .push(Action::Open(Page::Playlist(track.playlist_id.clone())));
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn counts(
+        pending: u64,
+        resolving: u64,
+        downloading: u64,
+        done: u64,
+        failed: u64,
+    ) -> PlaylistCounts {
+        PlaylistCounts {
+            playlist_id: "playlist".to_string(),
+            pending,
+            resolving,
+            downloading,
+            done,
+            unmatched: 0,
+            failed,
+        }
+    }
+
+    fn library_track(playlist_id: &str, track_id: &str, path: &str) -> SyncedLibraryTrack {
+        SyncedLibraryTrack {
+            playlist_id: playlist_id.to_string(),
+            track_id: track_id.to_string(),
+            title: "Title".to_string(),
+            artists: "Artist".to_string(),
+            album: "Album".to_string(),
+            duration_ms: 1000,
+            quality: None,
+            provider: None,
+            path: PathBuf::from(path),
+        }
+    }
+
+    #[test]
+    fn a_failed_track_never_shows_the_finished_check_mark() {
+        assert!(matches!(
+            playlist_pill_icon(&counts(0, 0, 0, 3, 1)),
+            Icon::CircleAlert
+        ));
+    }
+
+    #[test]
+    fn work_in_progress_shows_the_spinner_even_with_failures() {
+        assert!(matches!(
+            playlist_pill_icon(&counts(2, 0, 0, 3, 1)),
+            Icon::Refresh
+        ));
+    }
+
+    #[test]
+    fn a_finished_playlist_without_failures_shows_the_check_mark() {
+        assert!(matches!(
+            playlist_pill_icon(&counts(0, 0, 0, 4, 0)),
+            Icon::CircleCheck
+        ));
+    }
+
+    #[test]
+    fn a_double_click_on_the_title_queues_one_play() {
+        // Press one is a plain click, press two is the double click.
+        assert!(!library_row_activation(true, false, false, false));
+        assert!(library_row_activation(false, true, false, false));
+    }
+
+    #[test]
+    fn a_double_click_on_the_play_control_queues_one_action() {
+        // Press one toggles or starts playback. Press two must not repeat it.
+        assert!(library_row_activation(true, false, true, false));
+        assert!(!library_row_activation(false, true, true, false));
+    }
+
+    #[test]
+    fn a_single_click_on_the_title_does_not_play() {
+        assert!(!library_row_activation(true, false, false, false));
+    }
+
+    #[test]
+    fn keyboard_activation_plays_the_track() {
+        assert!(library_row_activation(true, false, false, true));
+    }
+
+    #[test]
+    fn a_row_keeps_its_identity_when_the_list_changes() {
+        let first = library_track("p1", "t1", "/music/one.flac");
+        let moved = library_track("p1", "t1", "/music/one.flac");
+        let other = library_track("p1", "t2", "/music/two.flac");
+        assert_eq!(
+            egui::Id::new(library_row_key(&first)),
+            egui::Id::new(library_row_key(&moved))
+        );
+        assert_ne!(
+            egui::Id::new(library_row_key(&first)),
+            egui::Id::new(library_row_key(&other))
+        );
+    }
+
+    #[test]
+    fn cooldown_banner_text_stays_english_in_english() {
+        let cooldown = ProviderCooldown {
+            provider: "qobuz".to_string(),
+            retry_at_unix_secs: 0,
+            remaining_secs: 30,
+            message: String::new(),
+        };
+        assert_eq!(
+            format_cooldown_banner(Locale::English, &cooldown),
+            "qobuz: rate limited, retrying in 30s"
+        );
+    }
 }

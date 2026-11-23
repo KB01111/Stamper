@@ -1027,14 +1027,8 @@ fn nav_row_with_badge(
         let icon_rect =
             Rect::from_center_size(pos2(rect.left() + 22.0, rect.center().y), Vec2::splat(22.0));
         icon.image(color, 22.0).paint_at(ui, icon_rect);
-        ui.painter().text(
-            pos2(rect.left() + 46.0, rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            label,
-            theme::bold(15.0),
-            color,
-        );
-        if let Some(badge) = badge {
+        // The badge is laid out first so the label can stop short of it.
+        let badge_pill = badge.map(|badge| {
             let galley = ui.painter().layout_no_wrap(
                 badge.to_string(),
                 theme::semibold(11.0),
@@ -1045,8 +1039,25 @@ fn nav_row_with_badge(
                 pos2(rect.right() - pill_size.x / 2.0 - 8.0, rect.center().y),
                 pill_size,
             );
+            (galley, pill_rect)
+        });
+        let label_painter = match &badge_pill {
+            Some((_, pill_rect)) => ui.painter().with_clip_rect(Rect::from_min_max(
+                rect.min,
+                pos2(pill_rect.left() - 6.0, rect.max.y),
+            )),
+            None => ui.painter().clone(),
+        };
+        label_painter.text(
+            pos2(rect.left() + 46.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            theme::bold(15.0),
+            color,
+        );
+        if let Some((galley, pill_rect)) = badge_pill {
             ui.painter()
-                .rect_filled(pill_rect, pill_size.y / 2.0, palette.accent);
+                .rect_filled(pill_rect, pill_rect.height() / 2.0, palette.accent);
             ui.painter().galley(
                 pill_rect.center() - galley.size() / 2.0,
                 galley,
