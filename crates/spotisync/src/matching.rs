@@ -2,14 +2,19 @@
 //!
 //! Matching follows strict ordered rules and never silently substitutes a
 //! different recording (such as live, remix, acoustic, karaoke, instrumental,
-//! demo, cover, sped-up, slowed, radio edit, or extended variants):
+//! demo, cover, sped-up, slowed, radio edit, extended, clean, or explicit
+//! variants, or a different part or volume number):
 //!
-//! 1. Exact ISRC match (case-insensitive, stripped hyphens and spaces) -> [`MatchedBy::Isrc`].
+//! 1. Exact ISRC match (case-insensitive, stripped hyphens and spaces; malformed
+//!    and placeholder codes are ignored) -> [`MatchedBy::Isrc`].
 //! 2. Exact normalized title + primary artist match within tight duration
 //!    tolerance (default +/- 2000 ms) and matching recording variants -> [`MatchedBy::Exact`].
 //! 3. High-confidence fuzzy title + primary artist similarity within duration
 //!    tolerance (default +/- 5000 ms) and matching recording variants -> [`MatchedBy::Fuzzy`].
 //! 4. Otherwise [`MatchOutcome::Unmatched`].
+//!
+//! The ISRC and exact tiers prefer the highest lossless quality. The fuzzy tier
+//! prefers the most similar title and artist, using quality only as a tie-breaker.
 
 use crate::{Candidate, Quality, Query};
 use serde::{Deserialize, Serialize};
@@ -18,7 +23,7 @@ use std::collections::BTreeSet;
 /// How a candidate was matched to a query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MatchedBy {
-    /// Exact ISRC match (case-insensitive, stripped hyphens and spaces).
+    /// Exact, well-formed ISRC match (case-insensitive, stripped hyphens and spaces).
     Isrc,
     /// Exact normalized title and primary artist match within tight duration tolerance.
     Exact,
@@ -59,7 +64,12 @@ pub struct MatchConfig {
     pub fuzzy_title_threshold: f64,
     /// Minimum artist similarity score (0.0..=1.0) required for fuzzy matching.
     pub fuzzy_artist_threshold: f64,
-    /// Maximum quality tier to prefer when selecting among lossless candidates.
+    /// Quality ceiling applied to every candidate: `min(native, max_quality)`.
+    ///
+    /// The matcher cannot see the provider's own cap (`Provider::max_quality`)
+    /// because [`Candidate`] does not carry it. Callers must set this to the
+    /// provider's `max_quality()` (or lower) before matching, otherwise the
+    /// selected quality can exceed what the provider can serve.
     pub max_quality: Quality,
 }
 
@@ -101,6 +111,8 @@ enum RecordingVariant {
     SpeedAltered,
     RadioEdit,
     Extended,
+    Clean,
+    Explicit,
 }
 
 struct ScoredMatch<'a> {
@@ -111,7 +123,65 @@ struct ScoredMatch<'a> {
     duration_delta_ms: u64,
 }
 
+/// Which key ranks the hits of one tier first.
+#[derive(Debug, Clone, Copy)]
+enum Ranking {
+    /// Highest quality first, similarity as tie-breaker (ISRC and exact tiers).
+    Quality,
+    /// Most similar first, quality as tie-breaker (fuzzy tier).
+    Similarity,
+}
+
+/// Normalized identity of the query, computed once per call.
+struct QueryKey {
+    title: String,
+    artist: String,
+    variants: BTreeSet<RecordingVariant>,
+    parts: Option<Vec<u32>>,
+    duration_ms: u64,
+}
+
+impl QueryKey {
+    fn new(query: &Query) -> Self {
+        Self {
+            title: normalize_title(&query.title),
+            artist: normalize_primary_artist(primary_artist(
+                &query.artists,
+                query.album_artist.as_deref(),
+            )),
+            variants: extract_recording_variants(&query.title, &query.artists),
+            parts: part_numbers(&query.title),
+            duration_ms: query.duration_ms,
+        }
+    }
+}
+
+/// Normalized identity of one provider candidate.
+struct CandidateKey {
+    title: String,
+    artist: String,
+    variants: BTreeSet<RecordingVariant>,
+    parts: Option<Vec<u32>>,
+}
+
+impl CandidateKey {
+    fn new(cand: &Candidate) -> Self {
+        Self {
+            title: normalize_title(&cand.title),
+            artist: normalize_primary_artist(primary_artist(
+                &cand.artists,
+                cand.album_artist.as_deref(),
+            )),
+            variants: extract_recording_variants(&cand.title, &cand.artists),
+            parts: part_numbers(&cand.title),
+        }
+    }
+}
+
 /// Selects the best lossless candidate matching `query` according to strict rules.
+///
+/// `config.max_quality` is the ceiling for the selected quality. Set it to the
+/// provider's `max_quality()` (see [`MatchConfig::max_quality`]).
 pub fn select_best_match(
     query: &Query,
     candidates: &[Candidate],
@@ -125,133 +195,38 @@ pub fn select_best_match(
 
     let mut saw_lossy_match = false;
 
-    // Tier 1: Exact ISRC match.
+    // Tier 1: exact ISRC match.
     if let Some(q_isrc) = query.isrc.as_deref().and_then(normalize_isrc) {
-        let mut lossless_hits: Vec<ScoredMatch<'_>> = Vec::new();
-        for cand in candidates {
-            let Some(c_isrc) = cand.isrc.as_deref().and_then(normalize_isrc) else {
-                continue;
-            };
-            if c_isrc != q_isrc {
-                continue;
-            }
-            if let Some(native_q) = cand.quality() {
-                lossless_hits.push(ScoredMatch {
-                    candidate: cand,
-                    selected_quality: native_q.min(config.max_quality),
-                    native_quality: native_q,
-                    similarity_bps: 10_000,
-                    duration_delta_ms: query.duration_ms.abs_diff(cand.duration_ms),
-                });
-            } else {
-                saw_lossy_match = true;
-            }
-        }
-        if let Some(best) = pick_highest_quality(lossless_hits) {
+        let (hits, lossy) = isrc_hits(query, candidates, &q_isrc, config);
+        saw_lossy_match |= lossy;
+        if let Some(best) = pick_best(hits, Ranking::Quality) {
             return finalize_match(query, best, MatchedBy::Isrc);
         }
     }
 
-    let query_title_norm = normalize_title(&query.title);
-    let query_artist_norm = normalize_primary_artist(query.artists.first().map(String::as_str));
-    let query_variants = extract_recording_variants(&query.title, &query.artists);
-
-    if query_title_norm.is_empty() || query_artist_norm.is_empty() {
-        return MatchOutcome::Unmatched {
-            reason: if saw_lossy_match {
-                RejectReason::LossyOnly
-            } else {
-                RejectReason::NoStrictMatch
-            },
-        };
+    let key = QueryKey::new(query);
+    if key.title.is_empty() || key.artist.is_empty() {
+        return unmatched_reason(saw_lossy_match);
     }
 
-    // Tier 2: Exact normalized title + primary artist match within exact duration tolerance.
-    let mut exact_hits: Vec<ScoredMatch<'_>> = Vec::new();
-    for cand in candidates {
-        let duration_delta = query.duration_ms.abs_diff(cand.duration_ms);
-        if duration_delta > config.exact_duration_tolerance_ms {
-            continue;
-        }
-        let cand_variants = extract_recording_variants(&cand.title, &cand.artists);
-        if cand_variants != query_variants {
-            continue;
-        }
-
-        let cand_title_norm = normalize_title(&cand.title);
-        if cand_title_norm != query_title_norm {
-            continue;
-        }
-
-        let cand_artist_norm = normalize_primary_artist(candidate_primary_artist(cand));
-        if cand_artist_norm != query_artist_norm {
-            continue;
-        }
-
-        if let Some(native_q) = cand.quality() {
-            exact_hits.push(ScoredMatch {
-                candidate: cand,
-                selected_quality: native_q.min(config.max_quality),
-                native_quality: native_q,
-                similarity_bps: 10_000,
-                duration_delta_ms: duration_delta,
-            });
-        } else {
-            saw_lossy_match = true;
-        }
-    }
-    if let Some(best) = pick_highest_quality(exact_hits) {
+    // Tier 2: exact normalized title + primary artist within exact duration tolerance.
+    let (hits, lossy) = exact_hits(&key, candidates, config);
+    saw_lossy_match |= lossy;
+    if let Some(best) = pick_best(hits, Ranking::Quality) {
         return finalize_match(query, best, MatchedBy::Exact);
     }
 
-    // Tier 3: Strict fuzzy match within fuzzy duration tolerance and variant guards.
-    let query_artist_fuzzy = strip_leading_the(&query_artist_norm);
-    let mut fuzzy_hits: Vec<ScoredMatch<'_>> = Vec::new();
-    for cand in candidates {
-        let duration_delta = query.duration_ms.abs_diff(cand.duration_ms);
-        if duration_delta > config.fuzzy_duration_tolerance_ms {
-            continue;
-        }
-        let cand_variants = extract_recording_variants(&cand.title, &cand.artists);
-        if cand_variants != query_variants {
-            continue;
-        }
-
-        let cand_title_norm = normalize_title(&cand.title);
-        let cand_artist_norm = normalize_primary_artist(candidate_primary_artist(cand));
-        if cand_title_norm.is_empty() || cand_artist_norm.is_empty() {
-            continue;
-        }
-
-        let title_sim = string_similarity(&query_title_norm, &cand_title_norm);
-        if title_sim < config.fuzzy_title_threshold {
-            continue;
-        }
-
-        let cand_artist_fuzzy = strip_leading_the(&cand_artist_norm);
-        let artist_sim = string_similarity(&query_artist_norm, &cand_artist_norm)
-            .max(string_similarity(query_artist_fuzzy, cand_artist_fuzzy));
-        if artist_sim < config.fuzzy_artist_threshold {
-            continue;
-        }
-
-        let combined_bps = ((title_sim * 0.6 + artist_sim * 0.4) * 10_000.0).round() as u32;
-        if let Some(native_q) = cand.quality() {
-            fuzzy_hits.push(ScoredMatch {
-                candidate: cand,
-                selected_quality: native_q.min(config.max_quality),
-                native_quality: native_q,
-                similarity_bps: combined_bps,
-                duration_delta_ms: duration_delta,
-            });
-        } else {
-            saw_lossy_match = true;
-        }
-    }
-    if let Some(best) = pick_highest_quality(fuzzy_hits) {
+    // Tier 3: strict fuzzy match within fuzzy duration tolerance and variant guards.
+    let (hits, lossy) = fuzzy_hits(&key, candidates, config);
+    saw_lossy_match |= lossy;
+    if let Some(best) = pick_best(hits, Ranking::Similarity) {
         return finalize_match(query, best, MatchedBy::Fuzzy);
     }
 
+    unmatched_reason(saw_lossy_match)
+}
+
+fn unmatched_reason(saw_lossy_match: bool) -> MatchOutcome {
     MatchOutcome::Unmatched {
         reason: if saw_lossy_match {
             RejectReason::LossyOnly
@@ -259,6 +234,163 @@ pub fn select_best_match(
             RejectReason::NoStrictMatch
         },
     }
+}
+
+/// Tier 1 hits: candidates whose normalized ISRC equals the query's.
+fn isrc_hits<'a>(
+    query: &Query,
+    candidates: &'a [Candidate],
+    q_isrc: &str,
+    config: &MatchConfig,
+) -> (Vec<ScoredMatch<'a>>, bool) {
+    let mut hits = Vec::new();
+    let mut lossy = false;
+    for cand in candidates {
+        if cand.isrc.as_deref().and_then(normalize_isrc).as_deref() != Some(q_isrc) {
+            continue;
+        }
+        let delta = query.duration_ms.abs_diff(cand.duration_ms);
+        record_hit(
+            &mut hits,
+            &mut lossy,
+            cand,
+            10_000,
+            delta,
+            config.max_quality,
+        );
+    }
+    (hits, lossy)
+}
+
+/// Tier 2 hits: identical normalized title and primary artist, within the exact window.
+fn exact_hits<'a>(
+    key: &QueryKey,
+    candidates: &'a [Candidate],
+    config: &MatchConfig,
+) -> (Vec<ScoredMatch<'a>>, bool) {
+    let mut hits = Vec::new();
+    let mut lossy = false;
+    for cand in candidates {
+        let delta = key.duration_ms.abs_diff(cand.duration_ms);
+        if delta > config.exact_duration_tolerance_ms {
+            continue;
+        }
+        let cand_key = CandidateKey::new(cand);
+        if !shares_recording_guards(key, &cand_key)
+            || cand_key.title != key.title
+            || cand_key.artist != key.artist
+        {
+            continue;
+        }
+        record_hit(
+            &mut hits,
+            &mut lossy,
+            cand,
+            10_000,
+            delta,
+            config.max_quality,
+        );
+    }
+    (hits, lossy)
+}
+
+/// Tier 3 hits: similar title and artist, within the fuzzy window.
+fn fuzzy_hits<'a>(
+    key: &QueryKey,
+    candidates: &'a [Candidate],
+    config: &MatchConfig,
+) -> (Vec<ScoredMatch<'a>>, bool) {
+    let mut hits = Vec::new();
+    let mut lossy = false;
+    let query_artist_fuzzy = strip_leading_the(&key.artist);
+    for cand in candidates {
+        let delta = key.duration_ms.abs_diff(cand.duration_ms);
+        if delta > config.fuzzy_duration_tolerance_ms {
+            continue;
+        }
+        let cand_key = CandidateKey::new(cand);
+        if !shares_recording_guards(key, &cand_key)
+            || cand_key.title.is_empty()
+            || cand_key.artist.is_empty()
+        {
+            continue;
+        }
+
+        let title_sim = string_similarity(&key.title, &cand_key.title);
+        if title_sim < config.fuzzy_title_threshold {
+            continue;
+        }
+
+        let artist_sim = string_similarity(&key.artist, &cand_key.artist).max(string_similarity(
+            query_artist_fuzzy,
+            strip_leading_the(&cand_key.artist),
+        ));
+        if artist_sim < config.fuzzy_artist_threshold {
+            continue;
+        }
+
+        let combined_bps = ((title_sim * 0.6 + artist_sim * 0.4) * 10_000.0).round() as u32;
+        record_hit(
+            &mut hits,
+            &mut lossy,
+            cand,
+            combined_bps,
+            delta,
+            config.max_quality,
+        );
+    }
+    (hits, lossy)
+}
+
+/// Records a candidate that passed a tier's identity checks. Lossy candidates
+/// are only remembered, so the caller can report [`RejectReason::LossyOnly`].
+fn record_hit<'a>(
+    hits: &mut Vec<ScoredMatch<'a>>,
+    lossy: &mut bool,
+    cand: &'a Candidate,
+    similarity_bps: u32,
+    duration_delta_ms: u64,
+    max_quality: Quality,
+) {
+    match cand.quality() {
+        Some(native) => hits.push(ScoredMatch {
+            candidate: cand,
+            selected_quality: native.min(max_quality),
+            native_quality: native,
+            similarity_bps,
+            duration_delta_ms,
+        }),
+        None => *lossy = true,
+    }
+}
+
+/// Variant and part-number guards shared by the exact and fuzzy tiers.
+fn shares_recording_guards(query: &QueryKey, cand: &CandidateKey) -> bool {
+    query.variants == cand.variants
+        && parts_compatible(query.parts.as_deref(), cand.parts.as_deref())
+}
+
+/// Part numbers only conflict when both sides carry one and they differ.
+fn parts_compatible(a: Option<&[u32]>, b: Option<&[u32]>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x == y,
+        _ => true,
+    }
+}
+
+fn pick_best<'a>(mut matches: Vec<ScoredMatch<'a>>, ranking: Ranking) -> Option<ScoredMatch<'a>> {
+    matches.sort_by(|a, b| {
+        let by_quality = b.selected_quality.cmp(&a.selected_quality);
+        let by_similarity = b.similarity_bps.cmp(&a.similarity_bps);
+        let primary = match ranking {
+            Ranking::Quality => by_quality.then(by_similarity),
+            Ranking::Similarity => by_similarity.then(by_quality),
+        };
+        primary
+            .then_with(|| a.duration_delta_ms.cmp(&b.duration_delta_ms))
+            .then_with(|| b.native_quality.cmp(&a.native_quality))
+    });
+    matches.into_iter().next()
 }
 
 fn finalize_match(query: &Query, best: ScoredMatch<'_>, matched_by: MatchedBy) -> MatchOutcome {
@@ -280,40 +412,45 @@ fn finalize_match(query: &Query, best: ScoredMatch<'_>, matched_by: MatchedBy) -
     }
 }
 
-fn pick_highest_quality<'a>(mut matches: Vec<ScoredMatch<'a>>) -> Option<ScoredMatch<'a>> {
-    if matches.is_empty() {
-        return None;
-    }
-    matches.sort_by(|a, b| {
-        b.selected_quality
-            .cmp(&a.selected_quality)
-            .then_with(|| b.similarity_bps.cmp(&a.similarity_bps))
-            .then_with(|| a.duration_delta_ms.cmp(&b.duration_delta_ms))
-            .then_with(|| b.native_quality.cmp(&a.native_quality))
-    });
-    matches.into_iter().next()
-}
-
-fn candidate_primary_artist(cand: &Candidate) -> Option<&str> {
-    cand.artists
+/// Primary artist, falling back to the album artist when no track artist is set.
+/// Used identically for the query and for candidates.
+fn primary_artist<'a>(artists: &'a [String], album_artist: Option<&'a str>) -> Option<&'a str> {
+    artists
         .first()
         .map(String::as_str)
         .filter(|s| !s.trim().is_empty())
-        .or(cand.album_artist.as_deref())
+        .or(album_artist)
 }
 
 /// Normalizes an ISRC by stripping spaces and hyphens and uppercasing.
+///
+/// Returns `None` unless the result is a well-formed ISRC (2 letters, 3
+/// alphanumerics, 7 digits) that is not a placeholder.
 pub fn normalize_isrc(raw: &str) -> Option<String> {
     let cleaned: String = raw
         .chars()
         .filter(|c| !c.is_whitespace() && *c != '-')
         .map(|c| c.to_ascii_uppercase())
         .collect();
-    if cleaned.is_empty() {
-        None
-    } else {
-        Some(cleaned)
+    is_well_formed_isrc(&cleaned).then_some(cleaned)
+}
+
+/// Checks the 12-character ISRC layout and rejects placeholder codes: the
+/// unassigned `XX` and `ZZ` country codes, and an all-zero designation.
+fn is_well_formed_isrc(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    if bytes.len() != 12 {
+        return false;
     }
+    let (country, rest) = bytes.split_at(2);
+    let (registrant, designation) = rest.split_at(3);
+    let placeholder_country = matches!(country, [b'X', b'X'] | [b'Z', b'Z']);
+    let all_zero_designation = designation.iter().all(|&b| b == b'0');
+    country.iter().all(u8::is_ascii_uppercase)
+        && registrant.iter().all(u8::is_ascii_alphanumeric)
+        && designation.iter().all(u8::is_ascii_digit)
+        && !placeholder_country
+        && !all_zero_designation
 }
 
 /// Normalizes a track title for exact and fuzzy comparison.
@@ -397,6 +534,10 @@ fn strip_inline_feat(input: &str) -> String {
     }
 }
 
+/// Whether a bracketed or dash-suffixed qualifier is noise that may be dropped
+/// from the title. A qualifier that carries a recording variant (including the
+/// clean and explicit edits) is never ignorable, and neither is a title phrase
+/// that merely starts with "with" (such as "With or Without You").
 fn is_ignorable_qualifier(raw: &str) -> bool {
     let cleaned = normalize_punctuation_and_spaces(raw);
     if cleaned.is_empty() {
@@ -405,7 +546,6 @@ fn is_ignorable_qualifier(raw: &str) -> bool {
     if cleaned.starts_with("feat ")
         || cleaned.starts_with("ft ")
         || cleaned.starts_with("featuring ")
-        || cleaned.starts_with("with ")
     {
         return true;
     }
@@ -436,10 +576,6 @@ fn is_ignorable_qualifier(raw: &str) -> bool {
             | "deluxe"
             | "deluxe edition"
             | "anniversary edition"
-            | "explicit"
-            | "explicit version"
-            | "clean"
-            | "clean version"
             | "bonus track"
     )
 }
@@ -489,27 +625,81 @@ fn normalize_punctuation_and_spaces(input: &str) -> String {
     tokens.join(" ")
 }
 
+/// Folds Latin letters with diacritics or strokes to their base letters.
+///
+/// Input is lowercased first, so each arm covers both cases. `İ` lowers to `i`
+/// plus a combining dot, which is dropped.
 fn fold_diacritics(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
-    for ch in input.chars() {
+    for ch in input.chars().flat_map(char::to_lowercase) {
         match ch {
-            'á' | 'à' | 'â' | 'ä' | 'ã' | 'å' | 'ā' => out.push('a'),
+            'á' | 'à' | 'â' | 'ä' | 'ã' | 'å' | 'ā' | 'ă' | 'ą' => out.push('a'),
             'æ' => out.push_str("ae"),
             'ç' | 'ć' | 'č' => out.push('c'),
-            'é' | 'è' | 'ê' | 'ë' | 'ē' => out.push('e'),
-            'í' | 'ì' | 'î' | 'ï' | 'ī' => out.push('i'),
-            'ñ' | 'ń' => out.push('n'),
-            'ó' | 'ò' | 'ô' | 'ö' | 'õ' | 'ø' | 'ō' => out.push('o'),
+            'ď' | 'đ' => out.push('d'),
+            'é' | 'è' | 'ê' | 'ë' | 'ē' | 'ę' | 'ě' => out.push('e'),
+            'ğ' | 'ģ' => out.push('g'),
+            'í' | 'ì' | 'î' | 'ï' | 'ī' | 'ı' => out.push('i'),
+            '\u{307}' => {}
+            'ł' | 'ľ' | 'ĺ' => out.push('l'),
+            'ñ' | 'ń' | 'ň' => out.push('n'),
+            'ó' | 'ò' | 'ô' | 'ö' | 'õ' | 'ø' | 'ō' | 'ő' => out.push('o'),
             'œ' => out.push_str("oe"),
-            'ś' | 'š' => out.push('s'),
+            'ř' | 'ŕ' => out.push('r'),
+            'ś' | 'š' | 'ş' => out.push('s'),
             'ß' => out.push_str("ss"),
-            'ú' | 'ù' | 'û' | 'ü' | 'ū' => out.push('u'),
+            'ť' | 'ţ' => out.push('t'),
+            'ú' | 'ù' | 'û' | 'ü' | 'ū' | 'ů' | 'ű' | 'ų' => out.push('u'),
             'ý' | 'ÿ' => out.push('y'),
-            'ź' | 'ž' => out.push('z'),
+            'ź' | 'ž' | 'ż' => out.push('z'),
             other => out.push(other),
         }
     }
     out
+}
+
+/// Extracts the part or volume number(s) from a title, such as `[1]` for
+/// "Part 1", `[1, 5]` for "Pts. 1-5", or `[2]` for "Part II". Returns `None`
+/// when the title names no part.
+fn part_numbers(title: &str) -> Option<Vec<u32>> {
+    let normalized = normalize_punctuation_and_spaces(&fold_diacritics(&title.to_lowercase()));
+    let tokens: Vec<&str> = normalized.split_whitespace().collect();
+    for (idx, token) in tokens.iter().enumerate() {
+        if !matches!(*token, "part" | "parts" | "pts" | "volume" | "volumes") {
+            continue;
+        }
+        let numbers: Vec<u32> = tokens[idx + 1..]
+            .iter()
+            .map_while(|t| part_number(t))
+            .collect();
+        if !numbers.is_empty() {
+            return Some(numbers);
+        }
+    }
+    None
+}
+
+/// Parses one token after a part keyword: a short digit run or a roman numeral up to ten.
+fn part_number(token: &str) -> Option<u32> {
+    const ROMAN: [(&str, u32); 10] = [
+        ("i", 1),
+        ("ii", 2),
+        ("iii", 3),
+        ("iv", 4),
+        ("v", 5),
+        ("vi", 6),
+        ("vii", 7),
+        ("viii", 8),
+        ("ix", 9),
+        ("x", 10),
+    ];
+    if !token.is_empty() && token.len() <= 3 && token.bytes().all(|b| b.is_ascii_digit()) {
+        return token.parse().ok();
+    }
+    ROMAN
+        .iter()
+        .find(|(roman, _)| *roman == token)
+        .map(|(_, value)| *value)
 }
 
 fn extract_recording_variants(title: &str, artists: &[String]) -> BTreeSet<RecordingVariant> {
@@ -574,6 +764,70 @@ fn split_base_and_qualifiers(input: &str) -> (String, Vec<String>) {
     (head, qualifiers)
 }
 
+// Marker phrases and tokens per recording variant. Tokens match a single word,
+// phrases match consecutive words. Qualifier-only markers are handled inline.
+const LIVE_PHRASES: &[&str] = &[
+    "live at",
+    "live from",
+    "live in",
+    "live on",
+    "live session",
+    "live version",
+    "in concert",
+    "bbc session",
+    "peel session",
+];
+const REMIX_TOKENS: &[&str] = &["remix", "remixed", "rmx", "rework", "refix", "bootleg"];
+const REMIX_PHRASES: &[&str] = &["club mix", "dance mix", "house mix", "dub mix"];
+const ACOUSTIC_TOKENS: &[&str] = &["acoustic", "unplugged"];
+const ACOUSTIC_PHRASES: &[&str] = &["piano version", "orchestral version", "string version"];
+const KARAOKE_TOKENS: &[&str] = &["karaoke"];
+const KARAOKE_PHRASES: &[&str] = &["backing track", "sing along", "minus one"];
+const INSTRUMENTAL_TOKENS: &[&str] = &["instrumental"];
+const ACAPELLA_TOKENS: &[&str] = &["acapella"];
+const ACAPELLA_PHRASES: &[&str] = &["a cappella", "vocals only"];
+const DEMO_TOKENS: &[&str] = &["outtake"];
+const DEMO_PHRASES: &[&str] = &[
+    "demo version",
+    "early version",
+    "rough mix",
+    "alternate take",
+    "alt take",
+    "alternate version",
+];
+const COVER_TOKENS: &[&str] = &["tribute"];
+const COVER_PHRASES: &[&str] = &[
+    "originally performed by",
+    "in the style of",
+    "made famous by",
+    "cover version",
+];
+const SPEED_TOKENS: &[&str] = &["nightcore", "slowed"];
+const SPEED_PHRASES: &[&str] = &["sped up", "speed up", "8d audio"];
+const RADIO_PHRASES: &[&str] = &[
+    "radio edit",
+    "radio version",
+    "single edit",
+    "single version",
+    "short version",
+];
+const EXTENDED_PHRASES: &[&str] = &[
+    "extended mix",
+    "extended version",
+    "extended edit",
+    "long version",
+    "club version",
+    "12 inch",
+];
+
+fn any_token(tokens: &[&str], list: &[&str]) -> bool {
+    list.iter().any(|t| tokens.contains(t))
+}
+
+fn any_phrase(tokens: &[&str], list: &[&str]) -> bool {
+    list.iter().any(|p| contains_token_phrase(tokens, p))
+}
+
 fn extract_variants_from_segment(segment: &str, is_qualifier: bool) -> BTreeSet<RecordingVariant> {
     let mut found = BTreeSet::new();
     let cleaned = normalize_punctuation_and_spaces(segment);
@@ -582,128 +836,84 @@ fn extract_variants_from_segment(segment: &str, is_qualifier: bool) -> BTreeSet<
     }
 
     let tokens: Vec<&str> = cleaned.split_whitespace().collect();
-    let has_token = |t: &str| tokens.contains(&t);
-    let has_phrase = |phrase: &str| contains_token_phrase(&tokens, phrase);
+    // Single words that only count as a marker inside a bracket or dash qualifier.
+    let qualifier_token = |token: &str| is_qualifier && tokens.contains(&token);
 
-    // Live markers.
-    if has_phrase("live at")
-        || has_phrase("live from")
-        || has_phrase("live in")
-        || has_phrase("live on")
-        || has_phrase("live session")
-        || has_phrase("live version")
-        || has_phrase("in concert")
-        || has_phrase("bbc session")
-        || has_phrase("peel session")
-        || (is_qualifier && has_token("live"))
-    {
+    if any_phrase(&tokens, LIVE_PHRASES) || qualifier_token("live") {
         found.insert(RecordingVariant::Live);
     }
 
     // Remix / club mix markers (excluding "original mix" and "remaster").
-    if has_token("remix")
-        || has_token("remixed")
-        || has_token("rmx")
-        || has_token("rework")
-        || has_token("refix")
-        || has_token("bootleg")
-        || has_phrase("club mix")
-        || has_phrase("dance mix")
-        || has_phrase("house mix")
-        || has_phrase("dub mix")
+    if any_token(&tokens, REMIX_TOKENS)
+        || any_phrase(&tokens, REMIX_PHRASES)
         || (is_qualifier
-            && (has_token("dub")
-                || has_token("vip")
-                || (has_token("mix") && !has_phrase("original mix"))))
+            && (qualifier_token("dub")
+                || qualifier_token("vip")
+                || (qualifier_token("mix") && !contains_token_phrase(&tokens, "original mix"))))
     {
         found.insert(RecordingVariant::Remix);
     }
 
-    // Acoustic / unplugged markers.
-    if has_token("acoustic")
-        || has_token("unplugged")
-        || has_phrase("piano version")
-        || has_phrase("orchestral version")
-        || has_phrase("string version")
-        || (is_qualifier && (has_token("stripped") || has_token("orchestral")))
+    if any_token(&tokens, ACOUSTIC_TOKENS)
+        || any_phrase(&tokens, ACOUSTIC_PHRASES)
+        || (is_qualifier && (qualifier_token("stripped") || qualifier_token("orchestral")))
     {
         found.insert(RecordingVariant::Acoustic);
     }
 
-    // Karaoke markers.
-    if has_token("karaoke")
-        || has_phrase("backing track")
-        || has_phrase("sing along")
-        || has_phrase("minus one")
-    {
+    if any_token(&tokens, KARAOKE_TOKENS) || any_phrase(&tokens, KARAOKE_PHRASES) {
         found.insert(RecordingVariant::Karaoke);
     }
 
-    // Instrumental markers.
-    if has_token("instrumental") || (is_qualifier && has_token("inst")) {
+    if any_token(&tokens, INSTRUMENTAL_TOKENS) || (is_qualifier && qualifier_token("inst")) {
         found.insert(RecordingVariant::Instrumental);
     }
 
-    // Acapella markers.
-    if has_token("acapella") || has_phrase("a cappella") || has_phrase("vocals only") {
+    if any_token(&tokens, ACAPELLA_TOKENS) || any_phrase(&tokens, ACAPELLA_PHRASES) {
         found.insert(RecordingVariant::Acapella);
     }
 
-    // Demo / alternate take markers.
-    if has_phrase("demo version")
-        || has_phrase("early version")
-        || has_phrase("rough mix")
-        || has_phrase("alternate take")
-        || has_phrase("alt take")
-        || has_phrase("alternate version")
-        || has_token("outtake")
-        || (is_qualifier && has_token("demo"))
+    if any_phrase(&tokens, DEMO_PHRASES)
+        || any_token(&tokens, DEMO_TOKENS)
+        || qualifier_token("demo")
     {
         found.insert(RecordingVariant::Demo);
     }
 
-    // Cover / tribute markers.
-    if has_token("tribute")
-        || has_phrase("originally performed by")
-        || has_phrase("in the style of")
-        || has_phrase("made famous by")
-        || has_phrase("cover version")
-        || (is_qualifier && has_token("cover"))
+    if any_token(&tokens, COVER_TOKENS)
+        || any_phrase(&tokens, COVER_PHRASES)
+        || qualifier_token("cover")
     {
         found.insert(RecordingVariant::CoverOrTribute);
     }
 
-    // Sped up / slowed / nightcore markers.
-    if has_phrase("sped up")
-        || has_phrase("speed up")
-        || has_token("nightcore")
-        || has_token("slowed")
-        || has_phrase("8d audio")
-        || (is_qualifier && has_token("reverb"))
+    if any_phrase(&tokens, SPEED_PHRASES)
+        || any_token(&tokens, SPEED_TOKENS)
+        || qualifier_token("reverb")
     {
         found.insert(RecordingVariant::SpeedAltered);
     }
 
-    // Radio edit / single edit markers.
-    if has_phrase("radio edit")
-        || has_phrase("radio version")
-        || has_phrase("single edit")
-        || has_phrase("single version")
-        || has_phrase("short version")
-    {
+    if any_phrase(&tokens, RADIO_PHRASES) {
         found.insert(RecordingVariant::RadioEdit);
     }
 
-    // Extended / 12-inch markers.
-    if has_phrase("extended mix")
-        || has_phrase("extended version")
-        || has_phrase("extended edit")
-        || has_phrase("long version")
-        || has_phrase("club version")
-        || has_phrase("12 inch")
-        || (is_qualifier && has_token("extended"))
-    {
+    if any_phrase(&tokens, EXTENDED_PHRASES) || qualifier_token("extended") {
         found.insert(RecordingVariant::Extended);
+    }
+
+    // Clean and explicit editions are whole-qualifier markers only, so a song
+    // titled "Clean" keeps its base title.
+    if is_qualifier {
+        match cleaned.as_str() {
+            "clean" | "clean version" => {
+                found.insert(RecordingVariant::Clean);
+            }
+            "explicit" | "explicit version" => {
+                found.insert(RecordingVariant::Explicit);
+            }
+            _ => {}
+        }
     }
 
     found
@@ -717,8 +927,11 @@ fn contains_token_phrase(tokens: &[&str], phrase: &str) -> bool {
     tokens.windows(needle.len()).any(|w| w == needle.as_slice())
 }
 
-/// Computes strict string similarity in `0.0..=1.0`, blending Jaro-Winkler and
-/// normalized Levenshtein distance so prefix coincidences cannot inflate scores.
+/// Computes string similarity in `0.0..=1.0` as a fixed blend:
+/// `0.45 * jaro_winkler + 0.55 * normalized_levenshtein`.
+///
+/// Jaro-Winkler rewards a shared prefix, so the edit-distance term carries more
+/// weight. Short titles that only share a prefix therefore cannot score high.
 pub fn string_similarity(a: &str, b: &str) -> f64 {
     if a == b {
         return 1.0;
@@ -728,7 +941,6 @@ pub fn string_similarity(a: &str, b: &str) -> f64 {
     }
     let jw = jaro_winkler(a, b);
     let lev = normalized_levenshtein(a, b);
-    // Require both metrics to agree closely so short prefix-similar titles cannot slip through.
     0.45 * jw + 0.55 * lev
 }
 
@@ -822,6 +1034,50 @@ fn jaro_winkler(a: &str, b: &str) -> f64 {
 mod tests {
     use super::*;
 
+    fn query(title: &str, artist: &str, duration_ms: u64) -> Query {
+        Query {
+            isrc: None,
+            title: title.to_string(),
+            artists: vec![artist.to_string()],
+            album: "Album".to_string(),
+            duration_ms,
+            album_artist: None,
+            track_number: None,
+            disc_number: None,
+            year: None,
+            cover_url: None,
+        }
+    }
+
+    fn candidate(
+        id: &str,
+        title: &str,
+        artist: &str,
+        duration_ms: u64,
+        bit_depth: u8,
+        sample_rate_hz: u32,
+    ) -> Candidate {
+        Candidate {
+            provider: "qobuz",
+            track_id: id.to_string(),
+            isrc: None,
+            title: title.to_string(),
+            artists: vec![artist.to_string()],
+            album: None,
+            album_artist: None,
+            track_number: None,
+            disc_number: None,
+            year: None,
+            bit_depth: Some(bit_depth),
+            sample_rate_hz: Some(sample_rate_hz),
+            duration_ms,
+            lossless: true,
+            cover_url: None,
+            source_url: None,
+            lyrics_lrc: None,
+        }
+    }
+
     #[test]
     fn normalizes_title_noise_without_stripping_variants() {
         assert_eq!(
@@ -856,5 +1112,151 @@ mod tests {
             Some("USQX91300105".to_string())
         );
         assert_eq!(normalize_isrc("   "), None);
+    }
+
+    #[test]
+    fn isrc_rejects_malformed_and_placeholder_codes() {
+        assert_eq!(normalize_isrc("XX0000000000"), None);
+        assert_eq!(normalize_isrc("000000000000"), None);
+        assert_eq!(normalize_isrc("ZZ0000000001"), None);
+        assert_eq!(normalize_isrc("US-QX9-13-0000"), None);
+        assert_eq!(normalize_isrc("1234567890AB"), None);
+        assert_eq!(normalize_isrc("USQX9130010"), None);
+    }
+
+    #[test]
+    fn placeholder_isrc_never_matches_by_isrc() {
+        for placeholder in ["XX0000000000", "000000000000"] {
+            let mut q = query("Same Title", "Same Artist", 200_000);
+            q.isrc = Some(placeholder.to_string());
+            let mut c = candidate("c1", "Same Title", "Same Artist", 200_000, 16, 44_100);
+            c.isrc = Some(placeholder.to_string());
+            match select_best_match(&q, &[c], &MatchConfig::default()) {
+                MatchOutcome::Matched { matched_by, .. } => {
+                    assert_ne!(matched_by, MatchedBy::Isrc, "placeholder {placeholder}");
+                }
+                other => panic!("placeholder {placeholder}: expected a match, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn fuzzy_tier_ranks_similarity_before_quality() {
+        // "midnight ci" is a lower-similarity 24/192 recording; "midnight citys" is
+        // a near-identical 16/44 recording. The near one must win.
+        let far_sim = string_similarity("midnight city", "midnight ci");
+        let near_sim = string_similarity("midnight city", "midnight citys");
+        assert!(
+            far_sim >= 0.86 && far_sim < near_sim,
+            "{far_sim} {near_sim}"
+        );
+
+        let q = query("Midnight City", "M83", 361_000);
+        let candidates = vec![
+            candidate("far", "midnight ci", "M83", 361_000, 24, 192_000),
+            candidate("near", "midnight citys", "M83", 361_500, 16, 44_100),
+        ];
+        match select_best_match(&q, &candidates, &MatchConfig::default()) {
+            MatchOutcome::Matched {
+                candidate,
+                matched_by,
+                selected_quality,
+            } => {
+                assert_eq!(matched_by, MatchedBy::Fuzzy);
+                assert_eq!(candidate.track_id, "near");
+                assert_eq!(selected_quality, Quality::Flac16_44);
+            }
+            other => panic!("expected fuzzy match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn album_artist_fallback_applies_to_query_and_candidates() {
+        let mut q = query("Karma Police", "", 264_000);
+        q.artists = Vec::new();
+        q.album_artist = Some("Radiohead".to_string());
+        let mut c = candidate("c1", "Karma Police", "", 264_000, 16, 44_100);
+        c.artists = Vec::new();
+        c.album_artist = Some("Radiohead".to_string());
+        assert!(matches!(
+            select_best_match(&q, &[c.clone()], &MatchConfig::default()),
+            MatchOutcome::Matched {
+                matched_by: MatchedBy::Exact,
+                ..
+            }
+        ));
+
+        let q_plain = query("Karma Police", "Radiohead", 264_000);
+        assert!(matches!(
+            select_best_match(&q_plain, &[c], &MatchConfig::default()),
+            MatchOutcome::Matched {
+                matched_by: MatchedBy::Exact,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn part_numbers_are_extracted_and_compared() {
+        assert_eq!(part_numbers("Shine (Pts. 1-5)"), Some(vec![1, 5]));
+        assert_eq!(part_numbers("Symphony Part II"), Some(vec![2]));
+        assert_eq!(part_numbers("Part of Me (Part 2)"), Some(vec![2]));
+        assert_eq!(part_numbers("Part of Me"), None);
+        assert!(parts_compatible(Some(&[1]), None));
+        assert!(!parts_compatible(Some(&[1]), Some(&[2])));
+    }
+
+    #[test]
+    fn fold_diacritics_covers_letters_missing_from_the_table() {
+        for (input, expected) in [
+            ("Łukasz", "lukasz"),
+            ("ŁUKASZ", "lukasz"),
+            ("Őrség", "orseg"),
+            ("Űrhajó", "urhajo"),
+            ("Ğül", "gul"),
+            ("Řeka", "reka"),
+            ("Ěso", "eso"),
+            ("Ůly", "uly"),
+            ("Šaš", "sas"),
+            ("Žluť", "zlut"),
+            ("Čaj", "caj"),
+            ("Øyvind", "oyvind"),
+            ("Đorđe", "dorde"),
+            ("Izmır", "izmir"),
+            ("İstanbul", "istanbul"),
+        ] {
+            assert_eq!(fold_diacritics(&input.to_lowercase()), expected, "{input}");
+            assert_eq!(fold_diacritics(input), expected, "{input}");
+        }
+        assert_eq!(
+            normalize_primary_artist(Some("Łukasz Gottwald")),
+            normalize_primary_artist(Some("Lukasz Gottwald"))
+        );
+    }
+
+    #[test]
+    fn with_prefix_is_kept_as_title_text() {
+        assert_eq!(
+            normalize_title("With or Without You"),
+            "with or without you"
+        );
+        assert_eq!(
+            normalize_title("U2 - With or Without You"),
+            "u2 with or without you"
+        );
+        assert_eq!(normalize_title("Song (With Strings)"), "song with strings");
+    }
+
+    #[test]
+    fn clean_and_explicit_editions_are_recording_variants() {
+        let clean = extract_recording_variants("Song (Clean)", &["Artist".to_string()]);
+        let explicit =
+            extract_recording_variants("Song (Explicit Version)", &["Artist".to_string()]);
+        let plain = extract_recording_variants("Song", &["Artist".to_string()]);
+        let titled = extract_recording_variants("Clean", &["Artist".to_string()]);
+        assert!(clean.contains(&RecordingVariant::Clean));
+        assert!(explicit.contains(&RecordingVariant::Explicit));
+        assert!(plain.is_empty());
+        assert!(titled.is_empty());
     }
 }
