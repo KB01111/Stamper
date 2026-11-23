@@ -82,11 +82,13 @@ fn flac_crc16(data: &[u8]) -> u16 {
 /// Builds a single RFC-9639 compliant stereo CONSTANT-zero PCM FLAC audio frame
 /// of 192 samples with valid CRC-8 header and CRC-16 footer.
 fn build_pcm_flac_frame(bit_depth: u8, sample_rate_hz: u32) -> Vec<u8> {
+    // Frame header sample-rate codes (RFC 9639). 0b1100 is not 192 kHz: it means
+    // "read an 8-bit kHz value after the header", which corrupts the header.
     let sr_code: u8 = match sample_rate_hz {
         44_100 => 0x09,
         48_000 => 0x0A,
         96_000 => 0x0B,
-        192_000 => 0x0C,
+        192_000 => 0x03,
         _ => 0x00,
     };
     let bps_code: u8 = match bit_depth {
@@ -196,6 +198,7 @@ fn verify_raw_flac_bitstream(path: &Path) {
     let mut offset = 4usize;
     let mut saw_streaminfo = false;
     let mut saw_vorbis = false;
+    let mut streaminfo_rate = None;
     loop {
         assert!(
             offset + 4 <= data.len(),
@@ -214,7 +217,18 @@ fn verify_raw_flac_bitstream(path: &Path) {
             path.display()
         );
         match block_type {
-            0 => saw_streaminfo = true,
+            0 => {
+                saw_streaminfo = true;
+                // The packed sample rate is the 20 bits after the 10-byte block sizes and frame sizes.
+                if block_len >= 18 {
+                    let packed = u64::from_be_bytes(
+                        data[offset + 10..offset + 18]
+                            .try_into()
+                            .expect("eight packed STREAMINFO bytes"),
+                    );
+                    streaminfo_rate = Some((packed >> 44) as u32);
+                }
+            }
             4 => saw_vorbis = true,
             _ => {}
         }
@@ -236,6 +250,32 @@ fn verify_raw_flac_bitstream(path: &Path) {
     assert_eq!(&frame[..2], &[0xFF, 0xF8], "invalid FLAC frame sync header");
     let expected_crc8 = flac_crc8(&frame[..5]);
     assert_eq!(frame[5], expected_crc8, "FLAC frame header CRC-8 mismatch");
+
+    // The frame header's sample-rate code must agree with STREAMINFO. Code 0
+    // means "as STREAMINFO says"; any other code names its rate.
+    let rate = streaminfo_rate.expect("STREAMINFO carries a sample rate");
+    let frame_rate = match frame[2] & 0x0F {
+        0 => rate,
+        1 => 88_200,
+        2 => 176_400,
+        3 => 192_000,
+        4 => 8_000,
+        5 => 16_000,
+        6 => 22_050,
+        7 => 24_000,
+        8 => 32_000,
+        9 => 44_100,
+        10 => 48_000,
+        11 => 96_000,
+        _ => 0,
+    };
+    assert_eq!(
+        frame_rate,
+        rate,
+        "frame header sample-rate code {:#x} disagrees with STREAMINFO {rate} Hz in {}",
+        frame[2] & 0x0F,
+        path.display()
+    );
     let expected_crc16 = flac_crc16(&frame[..frame.len() - 2]);
     let actual_crc16 = u16::from_be_bytes([frame[frame.len() - 2], frame[frame.len() - 1]]);
     assert_eq!(actual_crc16, expected_crc16, "FLAC frame CRC-16 mismatch");
@@ -1069,6 +1109,17 @@ async fn checklist_1_ten_track_playlist_end_to_end_sync_and_flac_integrity() {
         assert_eq!(flac.properties().bit_depth(), *exp_bits);
         assert_eq!(flac.properties().sample_rate(), *exp_rate);
         assert_eq!(flac.properties().channels(), 2);
+        // The detected quality follows the file's own stream properties: 24/192
+        // for the hi-res tracks, not just the rate the provider advertised.
+        assert_eq!(
+            row.quality.as_deref(),
+            Some(Quality::from_stream_params(Some(*exp_bits), Some(*exp_rate)).as_str()),
+            "{} must be detected from its STREAMINFO",
+            track.title
+        );
+        if *exp_rate == 192_000 {
+            assert_eq!(row.quality.as_deref(), Some("flac_24_192"));
+        }
 
         let vorbis = flac
             .vorbis_comments()

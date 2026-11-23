@@ -21,6 +21,9 @@ pub const DEFAULT_BASE_URL: &str = "https://www.qobuz.com/api.json/0.2";
 pub const PROVIDER_ID: &str = "qobuz";
 
 const FLAC_MAGIC: &[u8; 4] = b"fLaC";
+/// Smallest plausible FLAC payload: the 4-byte magic, the 4-byte header of the
+/// mandatory STREAMINFO block, and its 34-byte body.
+const FLAC_MIN_LEN: usize = 42;
 const FORMAT_MP3_320: u32 = 5;
 const FORMAT_FLAC_16_44: u32 = 6;
 const FORMAT_FLAC_24_96: u32 = 7;
@@ -112,6 +115,7 @@ impl QobuzProvider {
         let client = Client::builder()
             .timeout(config.timeout)
             .user_agent("spotisync/0.1")
+            .redirect(same_origin_redirects())
             .build()?;
         Ok(Self {
             credentials,
@@ -138,7 +142,8 @@ impl QobuzProvider {
             .header("X-User-Auth-Token", &self.credentials.user_auth_token)
             .query(&[("limit", "1")])
             .send()
-            .await?;
+            .await
+            .map_err(redact_http)?;
 
         let _ = check_http_status(response, "validate_credentials").await?;
         Ok(())
@@ -158,10 +163,11 @@ impl QobuzProvider {
             .header("X-User-Auth-Token", &self.credentials.user_auth_token)
             .query(&[("query", query_text), ("limit", limit.as_str())])
             .send()
-            .await?;
+            .await
+            .map_err(redact_http)?;
 
         let response = check_http_status(response, "track/search").await?;
-        let body = response.text().await?;
+        let body = response.text().await.map_err(redact_http)?;
         parse_search_response(&body)
     }
 }
@@ -179,7 +185,9 @@ impl Provider for QobuzProvider {
     async fn search(&self, q: &Query) -> Result<Vec<Candidate>> {
         if let Some(isrc) = q.isrc.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             let candidates = self.search_raw(isrc).await?;
-            if !candidates.is_empty() {
+            // Only an eligible ISRC hit ends the search. A lossy or
+            // non-streamable hit falls through to the text search.
+            if candidates.iter().any(|c| c.lossless) {
                 return Ok(candidates);
             }
         }
@@ -229,18 +237,23 @@ impl Provider for QobuzProvider {
             .header("X-User-Auth-Token", &self.credentials.user_auth_token)
             .query(&params)
             .send()
-            .await?;
+            .await
+            .map_err(redact_http)?;
 
         let response = check_http_status(response, "track/getFileUrl").await?;
-        let file_url_resp: QobuzFileUrlResponse = response
-            .json()
-            .await
-            .map_err(|e| SyncError::Parse(format!("failed to decode getFileUrl response: {e}")))?;
+        let file_url_resp: QobuzFileUrlResponse = response.json().await.map_err(|e| {
+            SyncError::Parse(format!(
+                "failed to decode getFileUrl response: {}",
+                e.without_url()
+            ))
+        })?;
 
+        // A preview is a per-track problem: the credentials were accepted.
         if file_url_resp.sample == Some(true) {
-            return Err(SyncError::AuthInvalid(
-                "Qobuz returned a preview sample instead of a full stream".to_string(),
-            ));
+            return Err(SyncError::PreviewOnly(format!(
+                "Qobuz returned a preview sample for {} instead of a full stream",
+                c.track_id
+            )));
         }
 
         if file_url_resp.format_id == Some(FORMAT_MP3_320) {
@@ -266,11 +279,24 @@ impl Provider for QobuzProvider {
                 SyncError::NotFound(format!("Qobuz returned no stream URL for {}", c.track_id))
             })?;
 
-        let stream_resp = self.client.get(stream_url).send().await?;
+        let stream_resp = self
+            .client
+            .get(stream_url)
+            .send()
+            .await
+            .map_err(redact_http)?;
         let stream_resp = check_http_status(stream_resp, "stream download").await?;
-        let bytes = stream_resp.bytes().await?;
+        let bytes = stream_resp.bytes().await.map_err(redact_http)?;
 
-        if bytes.len() < FLAC_MAGIC.len() || &bytes[..4] != FLAC_MAGIC {
+        if bytes.len() < FLAC_MIN_LEN {
+            return Err(SyncError::InvalidAudio(format!(
+                "Qobuz stream payload for {} is {} bytes, shorter than the {FLAC_MIN_LEN}-byte FLAC header",
+                c.track_id,
+                bytes.len()
+            )));
+        }
+
+        if &bytes[..FLAC_MAGIC.len()] != FLAC_MAGIC {
             return Err(SyncError::LossyOnly(format!(
                 "Qobuz stream payload for {} did not start with FLAC magic header",
                 c.track_id
@@ -330,8 +356,9 @@ pub fn parse_search_response(json: &str) -> Result<Vec<Candidate>> {
 
         let sample_rate_hz = item.maximum_sampling_rate.map(khz_or_hz_to_hz);
         let bit_depth = item.maximum_bit_depth;
-        let streamable = item.streamable.unwrap_or(true);
-        let lossless = streamable && bit_depth.unwrap_or(16) >= 16;
+        // Both fields must be present: a missing flag or bit depth is not
+        // treated as streamable or 16-bit lossless.
+        let lossless = item.streamable == Some(true) && bit_depth.is_some_and(|b| b >= 16);
         let track_id = item.id.to_string();
 
         candidates.push(Candidate {
@@ -400,14 +427,23 @@ fn combine_title_and_version(title: &str, version: Option<&str>) -> String {
     let Some(ver) = version.map(str::trim).filter(|v| !v.is_empty()) else {
         return trimmed_title.to_string();
     };
-    if trimmed_title
-        .to_ascii_lowercase()
-        .contains(&ver.to_ascii_lowercase())
-    {
+    if version_already_in_title(trimmed_title, ver) {
         trimmed_title.to_string()
     } else {
         format!("{trimmed_title} ({ver})")
     }
+}
+
+/// Returns true when `version` is already part of `title`: the title equals the
+/// version, or ends with it in parentheses or brackets. A plain substring match
+/// is not enough, so "Live Forever" with version "Live" still gets "(Live)".
+fn version_already_in_title(title: &str, version: &str) -> bool {
+    if title.eq_ignore_ascii_case(version) {
+        return true;
+    }
+    let lower = title.to_ascii_lowercase();
+    let ver = version.to_ascii_lowercase();
+    lower.ends_with(&format!("({ver})")) || lower.ends_with(&format!("[{ver}]"))
 }
 
 fn parse_year_prefix(date_str: &str) -> Option<u32> {
@@ -430,6 +466,35 @@ fn unix_timestamp_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Redirect policy for the credential-bearing client.
+///
+/// The app id and user token travel as custom headers, which reqwest does not
+/// strip on cross-origin redirects. Only redirects to the same scheme, host and
+/// port are followed (at most five hops). Anything else stops the chain, and
+/// the 3xx response is reported as a provider error.
+fn same_origin_redirects() -> reqwest::redirect::Policy {
+    const MAX_HOPS: usize = 5;
+    reqwest::redirect::Policy::custom(|attempt| {
+        let same_origin = attempt
+            .previous()
+            .last()
+            .is_some_and(|prev| prev.origin() == attempt.url().origin());
+        if same_origin && attempt.previous().len() < MAX_HOPS {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
+/// Drops the request URL from a transport error before it is stored or shown.
+///
+/// Qobuz stream URLs carry request signatures in their query string, and
+/// reqwest embeds the full URL in its `Display` and `Debug` output.
+fn redact_http(err: reqwest::Error) -> SyncError {
+    SyncError::Http(err.without_url())
+}
+
 async fn check_http_status(response: Response, endpoint: &str) -> Result<Response> {
     let status = response.status();
     if status.is_success() {
@@ -444,6 +509,9 @@ async fn check_http_status(response: Response, endpoint: &str) -> Result<Respons
     }
 
     if status == StatusCode::TOO_MANY_REQUESTS {
+        // Only the delta-seconds form ("Retry-After: 42") is parsed. The
+        // HTTP-date form, like a missing or malformed header, yields None.
+        // None means "no usable hint": the caller must use its default backoff.
         let retry_after_secs = response
             .headers()
             .get(reqwest::header::RETRY_AFTER)
@@ -600,5 +668,67 @@ mod tests {
             "Get Lucky (Radio Edit)"
         );
         assert_eq!(combine_title_and_version("Get Lucky", None), "Get Lucky");
+    }
+
+    #[test]
+    fn version_is_only_skipped_when_it_is_already_in_title() {
+        assert_eq!(
+            combine_title_and_version("Live Forever", Some("Live")),
+            "Live Forever (Live)"
+        );
+        assert_eq!(
+            combine_title_and_version("Remixed Live Show", Some("Remix")),
+            "Remixed Live Show (Remix)"
+        );
+        assert_eq!(
+            combine_title_and_version("Get Lucky (live)", Some("Live")),
+            "Get Lucky (live)"
+        );
+        assert_eq!(
+            combine_title_and_version("Get Lucky [Radio Edit]", Some("Radio Edit")),
+            "Get Lucky [Radio Edit]"
+        );
+        assert_eq!(
+            combine_title_and_version("Radio Edit", Some("Radio Edit")),
+            "Radio Edit"
+        );
+    }
+
+    fn parse_single_item(item: serde_json::Value) -> Candidate {
+        let json = serde_json::json!({ "tracks": { "items": [item] } }).to_string();
+        parse_search_response(&json)
+            .expect("search JSON parses")
+            .remove(0)
+    }
+
+    #[test]
+    fn lossless_requires_explicit_streamable_and_bit_depth() {
+        let lossless_of = |streamable: Option<bool>, depth: Option<u8>| {
+            let mut item = serde_json::json!({ "id": 1, "title": "Song", "duration": 200 });
+            if let Some(s) = streamable {
+                item["streamable"] = serde_json::json!(s);
+            }
+            if let Some(d) = depth {
+                item["maximum_bit_depth"] = serde_json::json!(d);
+            }
+            parse_single_item(item).lossless
+        };
+
+        assert!(!lossless_of(None, None), "missing fields are not eligible");
+        assert!(
+            !lossless_of(None, Some(24)),
+            "missing streamable is not eligible"
+        );
+        assert!(
+            !lossless_of(Some(true), None),
+            "missing bit depth is not eligible"
+        );
+        assert!(
+            !lossless_of(Some(false), Some(24)),
+            "non-streamable is not eligible"
+        );
+        assert!(!lossless_of(Some(true), Some(8)), "8-bit is not lossless");
+        assert!(lossless_of(Some(true), Some(16)));
+        assert!(lossless_of(Some(true), Some(24)));
     }
 }

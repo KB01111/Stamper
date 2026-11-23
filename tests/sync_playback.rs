@@ -2,7 +2,8 @@
 //! `spotisync` (`QobuzProvider` + `SyncStore` + `SyncQueue` + atomic `lofty`
 //! FLAC writer) against an in-process local mock HTTP server, then confirm
 //! every written FLAC file probes, decodes, and runs cleanly through
-//! Spotifast's own `local_player` (`symphonia` + EQ + `AudioTap` + limiter).
+//! Spotifast's own `local_player` (`symphonia` + EQ + `AudioTap`, with the
+//! output limiter after volume in the render stage).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -57,7 +58,8 @@ fn build_nonzero_pcm_flac(bit_depth: u8, sample_rate_hz: u32) -> Vec<u8> {
         44_100 => 0x09,
         48_000 => 0x0A,
         96_000 => 0x0B,
-        192_000 => 0x0C,
+        // 0b0011 is 192 kHz; 0b1100 would mean "8-bit kHz follows the header".
+        192_000 => 0x03,
         _ => 0x00,
     };
     let bps_code: u8 = match bit_depth {
@@ -367,7 +369,7 @@ async fn synced_ten_track_playlist_plays_through_spotifast_local_player() {
     assert_eq!(completed.len(), 10);
 
     // Verify every synced & lofty-tagged FLAC file plays cleanly through
-    // Spotifast's own local_player pipeline (symphonia -> EQ -> AudioTap -> limiter).
+    // Spotifast's own local_player pipeline (symphonia -> EQ -> AudioTap).
     for (idx, item) in completed.iter().enumerate() {
         assert_eq!(item.status, SyncStatus::Done);
         let path_str = item
@@ -400,8 +402,7 @@ async fn synced_ten_track_playlist_plays_through_spotifast_local_player() {
         let tap = AudioTap::new();
         let mut pipeline = AudioPipeline::new(eq, Arc::clone(&tap), sr, sr);
         assert!(!pipeline.is_resampling_output());
-        // Feed enough frames (> 8 ms look-ahead latency at 96 kHz = 768 frames)
-        // so the look-ahead limiter emits the non-silent signal.
+        // Several passes of the decoded track, as the worker feeds the pipeline.
         let mut out_all = Vec::new();
         for _ in 0..6 {
             let mut stereo_f64: Vec<f64> = samples.iter().map(|&s| f64::from(s)).collect();
@@ -413,5 +414,37 @@ async fn synced_ten_track_playlist_plays_through_spotifast_local_player() {
     }
 
     server.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A 192 kHz synthesized file must report 24/192 from its STREAMINFO and every
+/// frame must decode. The frame header's sample-rate code for 192 kHz is 0b0011;
+/// 0b1100 means "read an 8-bit kHz value after the header", which corrupts the
+/// header and makes decoders skip the frame.
+#[test]
+fn hires_192khz_synthesized_flac_reports_24_192_and_decodes_every_frame() {
+    let root = std::env::temp_dir().join(format!("spotifast-192khz-header-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("hires_192.flac");
+    std::fs::write(&path, build_nonzero_pcm_flac(24, 192_000)).unwrap();
+
+    let info = decode_flac_probe(&path).unwrap();
+    assert_eq!(info.sample_rate_hz, 192_000);
+    assert_eq!(info.bit_depth, Some(24));
+    assert_eq!(info.quality_label(), "24-bit / 192 kHz FLAC");
+    assert_eq!(
+        Quality::from_stream_params(info.bit_depth, Some(info.sample_rate_hz)),
+        Quality::Flac24_192
+    );
+
+    let (sr, channels, samples) = decode_flac_samples(&path).unwrap();
+    assert_eq!((sr, channels), (192_000, 2));
+    assert_eq!(
+        samples.len(),
+        192 * 2,
+        "the frame must decode, not be skipped as corrupt"
+    );
+    assert!(samples.iter().any(|&s| s.abs() > 1e-4));
+
     let _ = std::fs::remove_dir_all(&root);
 }

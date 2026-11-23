@@ -169,6 +169,32 @@ impl SyncStore {
         Self::init_connection(conn)
     }
 
+    /// Folds the committed rows of the write-ahead log into the main file at
+    /// `path`, so the main file alone holds them. A file that does not exist
+    /// has nothing to fold. Fails with [`SyncError::Store`] when another
+    /// connection keeps the log busy, in which case the main file may lag.
+    pub fn checkpoint(path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        if !path.is_file() {
+            return Ok(());
+        }
+        let conn = Connection::open(path).map_err(store_err)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(store_err)?;
+        // Columns: busy flag, frames in the log, frames folded in.
+        let (busy, _, _): (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(store_err)?;
+        if busy != 0 {
+            return Err(SyncError::Store(
+                "sync database is busy; its log was not folded in".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn init_connection(conn: Connection) -> Result<Self> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -252,7 +278,10 @@ impl SyncStore {
         Ok(inserted > 0)
     }
 
-    /// Returns all items currently in `pending` state ordered by `updated_at`.
+    /// Returns pending items ordered by `updated_at`, skipping disabled playlists.
+    ///
+    /// Items whose playlist has no `synced_playlists` row are kept, so tracks
+    /// enqueued without a playlist toggle still sync.
     pub fn list_pending(&self) -> Result<Vec<SyncItem>> {
         let conn = self.lock()?;
         let mut stmt = conn
@@ -261,6 +290,10 @@ impl SyncStore {
                         matched_by, provider, quality, path, attempts, error, updated_at
                  FROM sync_items
                  WHERE status = 'pending'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM synced_playlists p
+                     WHERE p.playlist_id = sync_items.playlist_id AND p.enabled = 0
+                   )
                  ORDER BY updated_at ASC, playlist_id ASC, track_id ASC",
             )
             .map_err(store_err)?;
@@ -333,14 +366,15 @@ impl SyncStore {
     ) -> Result<()> {
         let conn = self.lock()?;
         let now = now_unix_secs();
-        conn.execute(
-            "UPDATE sync_items
-             SET status = ?1, error = ?2, updated_at = ?3
-             WHERE playlist_id = ?4 AND track_id = ?5",
-            params![status.as_str(), error, now, playlist_id, track_id],
-        )
-        .map_err(store_err)?;
-        Ok(())
+        let changed = conn
+            .execute(
+                "UPDATE sync_items
+                 SET status = ?1, error = ?2, updated_at = ?3
+                 WHERE playlist_id = ?4 AND track_id = ?5",
+                params![status.as_str(), error, now, playlist_id, track_id],
+            )
+            .map_err(store_err)?;
+        expect_row(changed, playlist_id, track_id)
     }
 
     /// Updates an item's attempt counter and error while keeping or setting status.
@@ -354,21 +388,22 @@ impl SyncStore {
     ) -> Result<()> {
         let conn = self.lock()?;
         let now = now_unix_secs();
-        conn.execute(
-            "UPDATE sync_items
-             SET status = ?1, attempts = ?2, error = ?3, updated_at = ?4
-             WHERE playlist_id = ?5 AND track_id = ?6",
-            params![
-                status.as_str(),
-                i64::from(attempts),
-                error,
-                now,
-                playlist_id,
-                track_id
-            ],
-        )
-        .map_err(store_err)?;
-        Ok(())
+        let changed = conn
+            .execute(
+                "UPDATE sync_items
+                 SET status = ?1, attempts = ?2, error = ?3, updated_at = ?4
+                 WHERE playlist_id = ?5 AND track_id = ?6",
+                params![
+                    status.as_str(),
+                    i64::from(attempts),
+                    error,
+                    now,
+                    playlist_id,
+                    track_id
+                ],
+            )
+            .map_err(store_err)?;
+        expect_row(changed, playlist_id, track_id)
     }
 
     /// Marks an item as `done` with its resolved provider, match tier, quality, and file path.
@@ -383,28 +418,57 @@ impl SyncStore {
     ) -> Result<()> {
         let conn = self.lock()?;
         let now = now_unix_secs();
-        conn.execute(
-            "UPDATE sync_items
-             SET status = 'done',
-                 matched_by = ?1,
-                 provider = ?2,
-                 quality = ?3,
-                 path = ?4,
-                 error = NULL,
-                 updated_at = ?5
-             WHERE playlist_id = ?6 AND track_id = ?7",
-            params![
-                matched_by.as_str(),
-                provider,
-                quality.as_str(),
-                path,
-                now,
-                playlist_id,
-                track_id
-            ],
-        )
-        .map_err(store_err)?;
-        Ok(())
+        let changed = conn
+            .execute(
+                "UPDATE sync_items
+                 SET status = 'done',
+                     matched_by = ?1,
+                     provider = ?2,
+                     quality = ?3,
+                     path = ?4,
+                     error = NULL,
+                     updated_at = ?5
+                 WHERE playlist_id = ?6 AND track_id = ?7",
+                params![
+                    matched_by.as_str(),
+                    provider,
+                    quality.as_str(),
+                    path,
+                    now,
+                    playlist_id,
+                    track_id
+                ],
+            )
+            .map_err(store_err)?;
+        expect_row(changed, playlist_id, track_id)
+    }
+
+    /// Returns a `done` item that owns `path` but is a different recording.
+    ///
+    /// A recording is different when its track id differs, or when both ISRCs are
+    /// known and disagree. The track's own row is never returned.
+    pub fn find_other_owner(
+        &self,
+        path: &str,
+        track_id: &str,
+        isrc: Option<&str>,
+    ) -> Result<Option<SyncItem>> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT playlist_id, track_id, isrc, title, artists, status,
+                        matched_by, provider, quality, path, attempts, error, updated_at
+                 FROM sync_items
+                 WHERE path = ?1 AND status = 'done'
+                   AND (track_id <> ?2
+                        OR (isrc IS NOT NULL AND ?3 IS NOT NULL AND isrc <> ?3))
+                 LIMIT 1",
+                params![path, track_id, isrc],
+                row_to_sync_item,
+            )
+            .optional()
+            .map_err(store_err)?;
+        Ok(row)
     }
 
     /// Marks an item as `failed` with its final attempt count and error description.
@@ -428,14 +492,15 @@ impl SyncStore {
     pub fn mark_unmatched(&self, playlist_id: &str, track_id: &str, reason: &str) -> Result<()> {
         let conn = self.lock()?;
         let now = now_unix_secs();
-        conn.execute(
-            "UPDATE sync_items
-             SET status = 'unmatched', error = ?1, updated_at = ?2
-             WHERE playlist_id = ?3 AND track_id = ?4",
-            params![reason, now, playlist_id, track_id],
-        )
-        .map_err(store_err)?;
-        Ok(())
+        let changed = conn
+            .execute(
+                "UPDATE sync_items
+                 SET status = 'unmatched', error = ?1, updated_at = ?2
+                 WHERE playlist_id = ?3 AND track_id = ?4",
+                params![reason, now, playlist_id, track_id],
+            )
+            .map_err(store_err)?;
+        expect_row(changed, playlist_id, track_id)
     }
 
     /// Resets a failed, unmatched, or done item back to `pending` with zero attempts.
@@ -633,10 +698,24 @@ impl SyncStore {
     }
 }
 
+/// Errors when a write matched no row, so a vanished item is never reported as updated.
+fn expect_row(changed: usize, playlist_id: &str, track_id: &str) -> Result<()> {
+    if changed == 0 {
+        Err(SyncError::Store(format!(
+            "no sync item for playlist {playlist_id} track {track_id}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 fn row_to_sync_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncItem> {
     let artists_raw: String = row.get(4)?;
     let status_raw: String = row.get(5)?;
-    let status = SyncStatus::parse(&status_raw).unwrap_or(SyncStatus::Failed);
+    let status = SyncStatus::parse(&status_raw).unwrap_or_else(|| {
+        log::warn!("sync item has unknown status '{status_raw}'; treating it as failed");
+        SyncStatus::Failed
+    });
     Ok(SyncItem {
         playlist_id: row.get(0)?,
         track_id: row.get(1)?,
@@ -763,5 +842,126 @@ mod tests {
         let enabled = store.list_enabled_playlists().unwrap();
         assert_eq!(enabled.len(), 1);
         assert_eq!(enabled[0].playlist_id, "pl1");
+    }
+
+    #[test]
+    fn list_pending_skips_disabled_playlists_but_keeps_untoggled_ones() {
+        let store = SyncStore::open_in_memory().expect("open");
+        let q = sample_query();
+        store.set_playlist_enabled("pl_on", "On", true).unwrap();
+        store.set_playlist_enabled("pl_off", "Off", false).unwrap();
+        store.enqueue_track("pl_on", "t1", &q).unwrap();
+        store.enqueue_track("pl_off", "t1", &q).unwrap();
+        store.enqueue_track("pl_none", "t1", &q).unwrap();
+
+        let mut playlists: Vec<String> = store
+            .list_pending()
+            .expect("pending")
+            .into_iter()
+            .map(|item| item.playlist_id)
+            .collect();
+        playlists.sort();
+        assert_eq!(playlists, vec!["pl_none".to_string(), "pl_on".to_string()]);
+    }
+
+    #[test]
+    fn writes_to_missing_items_are_reported_not_ignored() {
+        let store = SyncStore::open_in_memory().expect("open");
+        assert!(
+            store
+                .update_status("nope", "nope", SyncStatus::Resolving, None)
+                .is_err()
+        );
+        assert!(
+            store
+                .mark_done(
+                    "nope",
+                    "nope",
+                    MatchedBy::Isrc,
+                    "qobuz",
+                    Quality::Flac16_44,
+                    "/x.flac"
+                )
+                .is_err()
+        );
+        assert!(store.mark_unmatched("nope", "nope", "reason").is_err());
+    }
+
+    #[test]
+    fn find_other_owner_reports_only_different_done_recordings() {
+        let store = SyncStore::open_in_memory().expect("open");
+        let q = sample_query();
+        store.enqueue_track("pl1", "t1", &q).unwrap();
+        store
+            .mark_done(
+                "pl1",
+                "t1",
+                MatchedBy::Isrc,
+                "qobuz",
+                Quality::Flac16_44,
+                "/m/a.flac",
+            )
+            .unwrap();
+
+        // Same track in another playlist is not a collision.
+        store.enqueue_track("pl2", "t1", &q).unwrap();
+        assert!(
+            store
+                .find_other_owner("/m/a.flac", "t1", q.isrc.as_deref())
+                .unwrap()
+                .is_none()
+        );
+
+        // A different track id owns the path.
+        assert!(
+            store
+                .find_other_owner("/m/a.flac", "t2", Some("OTHERISRC000"))
+                .unwrap()
+                .is_some()
+        );
+        // Same track id but a conflicting ISRC is also a different recording.
+        assert!(
+            store
+                .find_other_owner("/m/a.flac", "t1", Some("OTHERISRC000"))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A copy of the main file alone misses rows still in the write-ahead
+    /// log; after a checkpoint it holds them.
+    #[test]
+    fn checkpoint_puts_committed_rows_into_the_main_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("sync.db");
+        let copy = dir.path().join("copy.db");
+        let store = SyncStore::open(&db).expect("open");
+        store
+            .set_playlist_enabled("pl1", "Favorites", true)
+            .expect("enable");
+
+        std::fs::copy(&db, &copy).expect("copy before checkpoint");
+        let early = SyncStore::open(&copy).expect("open early copy");
+        assert!(
+            early.list_synced_playlists().expect("list").is_empty(),
+            "the row is still only in the log"
+        );
+        drop(early);
+        std::fs::remove_file(&copy).expect("remove early copy");
+
+        SyncStore::checkpoint(&db).expect("checkpoint");
+        std::fs::copy(&db, &copy).expect("copy after checkpoint");
+        let late = SyncStore::open(&copy).expect("open late copy");
+        let playlists = late.list_synced_playlists().expect("list");
+        assert_eq!(playlists.len(), 1);
+        assert_eq!(playlists[0].playlist_id, "pl1");
+        drop(store);
+    }
+
+    #[test]
+    fn checkpoint_of_a_missing_file_does_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        SyncStore::checkpoint(dir.path().join("absent.db")).expect("nothing to fold");
+        assert!(!dir.path().join("absent.db").exists());
     }
 }

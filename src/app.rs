@@ -3037,7 +3037,14 @@ impl App {
                     {
                         self.toast_error(error.clone());
                     }
+                    // Next and Previous move to another local song too.
+                    let previous = self.local_flac.track.as_ref().map(|track| &track.path);
+                    let changed =
+                        state.active && state.track.as_ref().map(|track| &track.path) != previous;
                     self.local_flac = state;
+                    if changed {
+                        self.request_lyrics_for_local_track();
+                    }
                 }
                 Event::SyncLibraryRootChosen(folder) => {
                     self.settings.sync.library_root = Some(folder.to_string_lossy().into_owned());
@@ -4595,6 +4602,16 @@ impl App {
             },
             local_file,
         })));
+    }
+
+    /// Asks for the lyrics of the local song that starts or changes, when
+    /// lyrics are on screen. This frame's song is the old one, so it is
+    /// refreshed first.
+    fn request_lyrics_for_local_track(&mut self) {
+        if self.show_lyrics_panel || self.lyrics_fullscreen.is_some() {
+            self.refresh_frame_now();
+            self.request_lyrics();
+        }
     }
 
     /// Pushes the Winamp window's always-on-top level to the live window.
@@ -12271,7 +12288,15 @@ impl App {
         if let Some(folder) = folder {
             self.backend.send(Command::ScanLocalFiles(folder));
         }
-        if self.settings.sync.library_root.is_none() {
+        // A blank library root is no root: the sync folder then follows the
+        // local files folder, as it does when none is set.
+        let custom_root = self
+            .settings
+            .sync
+            .library_root
+            .as_deref()
+            .is_some_and(|root| !root.trim().is_empty());
+        if !custom_root {
             self.push_sync_config();
         }
         self.actions.push(Action::RestartEngine);
@@ -14503,14 +14528,7 @@ impl App {
                 });
             }
             Action::SyncOpenTrackFolder(path) => {
-                let folder = if path.is_dir() {
-                    path
-                } else {
-                    path.parent()
-                        .map(std::path::Path::to_path_buf)
-                        .unwrap_or(path)
-                };
-                self.open_folder(folder);
+                self.backend.send(Command::OpenTrackFolder(path));
             }
             Action::SyncChooseLibraryRoot => self.backend.choose_sync_library_root(),
             Action::SyncClearLibraryRoot => {
@@ -14622,6 +14640,11 @@ impl App {
                         ..Default::default()
                     }
                 });
+                // Whatever starts now outranks a play-search still in flight,
+                // and a play held for the engine must not replay over it.
+                self.supersede_play_search();
+                self.queued_play = None;
+                self.played_row = None;
                 self.intent_track = None;
                 self.resume_load = None;
                 self.local_flac.active = true;
@@ -14632,6 +14655,7 @@ impl App {
                     queue,
                     index,
                 });
+                self.request_lyrics_for_local_track();
             }
             Action::LocalFlacPlayPause => self.backend.send(Command::LocalFlacPlayPause),
             Action::LocalFlacNext => self.backend.send(Command::LocalFlacNext),
@@ -15106,7 +15130,15 @@ impl App {
             self.reachable = conditions.online;
             self.backend.network_status(conditions.online);
         }
-        if crate::power::playback_needs_activity(&self.local) {
+        // Local FLAC playback holds the same activity and keep-awake as the
+        // librespot player, which it replaces while it plays.
+        let local_flac_playing = self.local_flac.active
+            && self.local_flac.error.is_none()
+            && matches!(
+                self.local_flac.playback,
+                Playback::Playing | Playback::Loading
+            );
+        if crate::power::playback_needs_activity(&self.local) || local_flac_playing {
             self.playback_activity
                 .get_or_insert_with(|| crate::power::Activity::begin("Spotify playback"));
             let power = &self.power;
@@ -37432,5 +37464,67 @@ mod tests {
         app.apply(Action::SetVolume(65), &ctx);
         assert!(!app.local_flac.muted);
         assert_eq!(app.local_flac.volume_percent, 65);
+    }
+
+    /// Local FLAC playback holds the keep-awake and App Nap activity while it
+    /// plays, and lets both go once it pauses.
+    #[test]
+    fn local_flac_playback_holds_the_keep_awake_too() {
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+        app.local_flac.active = true;
+        app.local_flac.playback = Playback::Playing;
+        app.sync_power(&ctx);
+        assert!(app.keep_awake.is_some());
+        assert!(app.playback_activity.is_some());
+        app.local_flac.playback = Playback::Paused;
+        app.sync_power(&ctx);
+        assert!(app.keep_awake.is_none(), "a paused FLAC song may sleep");
+        assert!(app.playback_activity.is_none());
+    }
+
+    /// A local song that starts outranks a play-search still in flight and a
+    /// Spotify play held for the engine, which must not replay over it.
+    #[test]
+    fn a_synced_track_start_supersedes_a_held_play_and_a_search() {
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+        app.queued_play = Some(PlayRequest::tracks(vec!["spotify:track:held".into()]));
+        let serial = app.play_search_serial;
+        app.apply(
+            Action::PlaySyncedTrack {
+                path: std::path::PathBuf::from("/music/instant_crush.flac"),
+                queue: Vec::new(),
+                index: 0,
+            },
+            &ctx,
+        );
+        assert!(app.queued_play.is_none());
+        assert_ne!(app.play_search_serial, serial);
+        app.backend.shutdown();
+    }
+
+    /// Lyrics on screen follow a local song that starts.
+    #[test]
+    fn a_local_song_starting_requests_the_lyrics_on_screen() {
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+        app.show_lyrics_panel = true;
+        let track = crate::local_player::LocalFlacTrack {
+            path: std::path::PathBuf::from("/music/instant_crush.flac"),
+            title: "Instant Crush".into(),
+            track_id: Some("tr1".into()),
+            ..Default::default()
+        };
+        app.apply(
+            Action::PlaySyncedTrack {
+                path: track.path.clone(),
+                queue: vec![track],
+                index: 0,
+            },
+            &ctx,
+        );
+        assert_eq!(app.lyrics_uri.as_deref(), Some("spotify:track:tr1"));
+        app.backend.shutdown();
     }
 }

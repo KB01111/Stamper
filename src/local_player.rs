@@ -1,10 +1,10 @@
 //! Direct local lossless FLAC playback through Spotifast's own audio pipeline.
 //!
 //! Plays downloaded FLAC files directly via `symphonia` -> `eq::Processor` ->
-//! `vis::AudioTap` (post-EQ, pre-volume, 44.1 kHz) -> `limiter::Limiter` ->
-//! `resample::Resampler` (only when the output device's sample rate differs
-//! from the FLAC's native rate) -> `fastframe-audio`, bypassing librespot and
-//! requiring no `spotify:local:` tag matching.
+//! `vis::AudioTap` (post-EQ, pre-volume, 44.1 kHz) -> `resample::Resampler`
+//! (only when the output device's sample rate differs from the FLAC's native
+//! rate) -> volume gain -> `limiter::Limiter` -> `fastframe-audio`, bypassing
+//! librespot and requiring no `spotify:local:` tag matching.
 //!
 //! All file I/O, decoding, DSP, and audio stream management run off the UI
 //! thread on a dedicated worker thread. Stopping playback releases the OS audio
@@ -316,6 +316,13 @@ fn frames_to_ms(frames: u64, sample_rate: u32) -> u64 {
     (u128::from(frames) * 1_000 / u128::from(sample_rate)) as u64
 }
 
+/// The length to report and seek within: the file's own frame count when it
+/// has one. Library metadata can run longer than the audio, and a seek past
+/// the end would leave the decoder with nothing to play.
+fn stream_duration_ms(file_ms: u64, metadata_ms: u64) -> u64 {
+    if file_ms > 0 { file_ms } else { metadata_ms }
+}
+
 /// Converts a volume percentage (0..=100) to linear gain using Spotifast's
 /// cubic volume curve, matching the built-in librespot and Soloist players.
 pub fn volume_gain(percent: u8, muted: bool) -> f32 {
@@ -323,6 +330,38 @@ pub fn volume_gain(percent: u8, muted: bool) -> f32 {
         return 0.0;
     }
     (f32::from(percent.min(100)) / 100.0).powi(3)
+}
+
+/// Gain for the centre and surround channels folded into front left and right
+/// (ITU-R BS.775: -3 dB).
+const DOWNMIX_MINUS_3_DB: f64 = std::f64::consts::FRAC_1_SQRT_2;
+
+/// Folds one interleaved multichannel frame into front left and right.
+///
+/// Channels follow the FLAC order: front left, front right, then centre,
+/// LFE and rear pairs depending on the count. The centre and rear pairs go
+/// into both outputs at -3 dB; the LFE is dropped. Layouts past 5.1 fold only
+/// the first rear pair.
+fn fold_frame_to_stereo(frame: &[f64]) -> (f64, f64) {
+    let at = |index: usize| frame.get(index).copied().unwrap_or(0.0);
+    let (centre, rear) = match frame.len() {
+        3 => (Some(2), None),
+        4 => (None, Some((2, 3))),
+        5 => (Some(2), Some((3, 4))),
+        _ => (Some(2), Some((4, 5))),
+    };
+    let mut left = at(0);
+    let mut right = at(1);
+    if let Some(index) = centre {
+        let folded = at(index) * DOWNMIX_MINUS_3_DB;
+        left += folded;
+        right += folded;
+    }
+    if let Some((rear_left, rear_right)) = rear {
+        left += at(rear_left) * DOWNMIX_MINUS_3_DB;
+        right += at(rear_right) * DOWNMIX_MINUS_3_DB;
+    }
+    (left, right)
 }
 
 /// Converts interleaved `channels`-channel `f64` samples into interleaved stereo
@@ -350,8 +389,9 @@ fn to_interleaved_stereo_f64(interleaved: &[f64], channels: usize, out: &mut Vec
             let frames = interleaved.len() / n;
             out.reserve(frames * 2);
             for frame in interleaved.chunks_exact(n) {
-                out.push(sanitize(frame[0]));
-                out.push(sanitize(frame[1]));
+                let (left, right) = fold_frame_to_stereo(frame);
+                out.push(sanitize(left));
+                out.push(sanitize(right));
             }
         }
     }
@@ -359,17 +399,18 @@ fn to_interleaved_stereo_f64(interleaved: &[f64], channels: usize, out: &mut Vec
 
 /// Stateful DSP pipeline for one local FLAC stream:
 /// `EQ (at native track rate)` -> `AudioTap (post-EQ, pre-volume, 44.1 kHz)` ->
-/// `Limiter (at native track rate)` -> `Resampler (only if track_sr != device_sr)`.
+/// `Resampler (only if track_sr != device_sr)`.
 ///
-/// Volume is deliberately NOT applied here so that:
+/// Volume and the output limiter are deliberately NOT applied here so that:
 /// 1. Visualizers always receive post-EQ, pre-volume audio ("zero volume still dances").
 /// 2. Live volume/mute changes take effect immediately on queued audio with a
 ///    smooth 30 ms ramp on the output render thread.
+/// 3. The limiter sees the signal as it reaches the speakers: it runs after the
+///    volume gain in [`LocalRender`], so quiet playback is never compressed.
 pub struct AudioPipeline {
     shared_eq: SharedEq,
     eq: EqProcessor,
     tap: Arc<AudioTap>,
-    limiter: Limiter,
     tap_resampler: Option<Resampler>,
     output_resampler: Option<Resampler>,
     track_sr: u32,
@@ -385,7 +426,6 @@ impl AudioPipeline {
             eq: EqProcessor::at_rate(shared_eq.clone(), track_sr),
             shared_eq,
             tap,
-            limiter: Limiter::new(f64::from(track_sr)),
             tap_resampler: Resampler::new(track_sr, VIS_SAMPLE_RATE, STEREO_CHANNELS),
             output_resampler: Resampler::new(track_sr, device_sr, STEREO_CHANNELS),
             track_sr,
@@ -417,18 +457,17 @@ impl AudioPipeline {
         }
     }
 
-    /// Discards filter, limiter, resampler, and visualizer history (on seek or track change).
+    /// Discards filter, resampler, and visualizer history (on seek or track change).
     pub fn reset(&mut self) {
         self.eq = EqProcessor::at_rate(self.shared_eq.clone(), self.track_sr);
-        self.limiter = Limiter::new(f64::from(self.track_sr));
         self.tap_resampler = Resampler::new(self.track_sr, VIS_SAMPLE_RATE, STEREO_CHANNELS);
         self.output_resampler = Resampler::new(self.track_sr, self.device_sr, STEREO_CHANNELS);
         self.tap.clear();
     }
 
     /// Processes interleaved stereo `f64` samples at `track_sr` through:
-    /// EQ -> `AudioTap` (44.1 kHz, post-EQ, pre-volume) -> Limiter -> optional
-    /// output resampler to `device_sr`.
+    /// EQ -> `AudioTap` (44.1 kHz, post-EQ, pre-volume) -> optional output
+    /// resampler to `device_sr`. The output is still pre-volume and unlimited.
     pub fn process_stereo_f64(&mut self, stereo: &mut [f64]) -> Vec<f32> {
         if stereo.is_empty() || !stereo.len().is_multiple_of(STEREO_CHANNELS) {
             return Vec::new();
@@ -454,10 +493,8 @@ impl AudioPipeline {
             self.tap.push(stereo, 1.0);
         }
 
-        // 3. Look-ahead soft-knee limiter at native track rate.
-        self.limiter.process(stereo, 1.0);
-
-        // 4. Convert to f32 and resample to device rate ONLY if track_sr != device_sr.
+        // 3. Convert to f32 and resample to device rate ONLY if track_sr != device_sr.
+        //    The limiter runs later, after the volume gain (see `LocalRender`).
         let out_f32: Vec<f32> = stereo.iter().map(|&v| v as f32).collect();
         match &mut self.output_resampler {
             Some(resampler) => resampler.process(&out_f32),
@@ -584,6 +621,9 @@ struct SampleQueue {
     /// Set whenever `Render::configure` switches the device sample rate so the
     /// worker can rebuild its output resampler.
     format_changed: AtomicBool,
+    /// Set by `clear` so the render thread discards the limiter's look-ahead
+    /// (audio from before the clear) before it plays anything new.
+    limiter_flush: AtomicBool,
 }
 
 impl SampleQueue {
@@ -595,6 +635,7 @@ impl SampleQueue {
             sample_rate: AtomicU32::new(initial_sample_rate.max(1)),
             channels: AtomicU16::new(STEREO_CHANNELS as u16),
             format_changed: AtomicBool::new(false),
+            limiter_flush: AtomicBool::new(false),
         })
     }
 
@@ -613,6 +654,8 @@ impl SampleQueue {
         let mut queue = self.samples.lock().unwrap_or_else(PoisonError::into_inner);
         queue.clear();
         self.queued_frames.store(0, Ordering::Relaxed);
+        // Under the lock, so the render thread sees it with the emptied queue.
+        self.limiter_flush.store(true, Ordering::Release);
     }
 
     fn queued_frames(&self) -> u64 {
@@ -628,13 +671,37 @@ impl SampleQueue {
     }
 }
 
+/// Runs one stereo frame through the output limiter at full scale.
+fn limit_frame(limiter: &mut Limiter, left: f32, right: f32) -> (f32, f32) {
+    let mut pair = [f64::from(left), f64::from(right)];
+    limiter.process(&mut pair, 1.0);
+    (pair[0] as f32, pair[1] as f32)
+}
+
+/// Empties the limiter's look-ahead of audio from before a clear: silence goes
+/// in and what comes out is discarded. The look-ahead is about 8 ms, so 10 ms
+/// of silence is always enough.
+fn flush_limiter(limiter: &mut Limiter, sample_rate: u32) {
+    for _ in 0..sample_rate.max(1) / 100 + 1 {
+        let _ = limit_frame(limiter, 0.0, 0.0);
+    }
+}
+
 /// `fastframe_audio::Render` implementation pulling stereo samples from
-/// [`SampleQueue`] and applying the post-tap volume ramp and transport fade.
+/// [`SampleQueue`], then applying the post-tap volume ramp and transport fade,
+/// then the output limiter.
+///
+/// The limiter comes last so that it guards the level that reaches the device.
+/// A quiet track at a low volume is not compressed by a ceiling that the
+/// volume has already brought far below full scale, and no volume setting can
+/// push the output past full scale.
 struct LocalRender {
     queue: Arc<SampleQueue>,
     volume_gain: Arc<AtomicU32>,
     transport: Arc<Envelope>,
     ramp: VolumeRamp,
+    /// Look-ahead limiter at the device rate, created whenever the rate changes.
+    limiter: Limiter,
     sample_rate: u32,
     channels: u16,
 }
@@ -653,6 +720,7 @@ impl LocalRender {
                 remaining: 0,
                 sample_rate: sr,
             },
+            limiter: Limiter::new(f64::from(sr)),
             sample_rate: sr,
             channels: STEREO_CHANNELS as u16,
         }
@@ -670,6 +738,8 @@ impl Render for LocalRender {
         self.queue.channels.store(ch, Ordering::Relaxed);
         self.transport.set_sample_rate(sr);
         if rate_changed {
+            // The look-ahead is counted in frames, so it must follow the rate.
+            self.limiter = Limiter::new(f64::from(sr));
             self.queue.clear();
             self.queue.format_changed.store(true, Ordering::Release);
         }
@@ -682,34 +752,41 @@ impl Render for LocalRender {
 
         let Ok(mut guard) = self.queue.samples.try_lock() else {
             // Avoid blocking the realtime audio callback if the worker briefly
-            // holds the lock; advance ramps over silence instead.
+            // holds the lock; advance ramps and the limiter over silence instead.
             for frame in out.chunks_mut(ch) {
                 let _ = self.ramp.next_gain(target_vol, sr);
                 let _ = self.transport.next_gain();
+                let _ = limit_frame(&mut self.limiter, 0.0, 0.0);
                 frame.fill(0.0);
             }
             return;
         };
 
+        if self.queue.limiter_flush.swap(false, Ordering::AcqRel) {
+            flush_limiter(&mut self.limiter, sr);
+        }
+
         for frame in out.chunks_mut(ch) {
             let gain = self.ramp.next_gain(target_vol, sr) * self.transport.next_gain();
-            if guard.len() >= STEREO_CHANNELS {
+            let (left, right) = if guard.len() >= STEREO_CHANNELS {
                 let left = guard.pop_front().unwrap_or(0.0);
                 let right = guard.pop_front().unwrap_or(0.0);
-                match ch {
-                    1 => frame[0] = 0.5 * (left + right) * gain,
-                    2 => {
-                        frame[0] = left * gain;
-                        frame[1] = right * gain;
-                    }
-                    _ => {
-                        frame[0] = left * gain;
-                        frame[1] = right * gain;
-                        frame[2..].fill(0.0);
-                    }
-                }
+                (left * gain, right * gain)
             } else {
-                frame.fill(0.0);
+                (0.0, 0.0)
+            };
+            let (left, right) = limit_frame(&mut self.limiter, left, right);
+            match ch {
+                1 => frame[0] = 0.5 * (left + right),
+                2 => {
+                    frame[0] = left;
+                    frame[1] = right;
+                }
+                _ => {
+                    frame[0] = left;
+                    frame[1] = right;
+                    frame[2..].fill(0.0);
+                }
             }
         }
         self.queue
@@ -1397,7 +1474,7 @@ impl PlayerWorker {
         self.state.active = true;
         self.state.playback = Playback::Playing;
         self.state.track = Some(track.clone());
-        self.state.duration_ms = track.duration_ms.max(info.duration_ms);
+        self.state.duration_ms = stream_duration_ms(info.duration_ms, track.duration_ms);
         self.state.position_ms = 0;
         self.state.error = None;
         self.last_position_emit = Instant::now();
@@ -1433,6 +1510,9 @@ impl PlayerWorker {
             self.release_output(false);
             return;
         };
+        // Where the ear is, before the old device's queue is dropped. The decoder
+        // is ahead of that by whatever was queued, and that audio is never heard.
+        let heard_ms = self.current_position_ms();
         let was_playing = self.state.playback == Playback::Playing;
         self.release_output(was_playing);
         match (self.opener)(
@@ -1453,6 +1533,9 @@ impl PlayerWorker {
                 }
                 self.output = Some(opened);
                 self.output_requested_sr = Some(track_sr);
+                // Rewind the decoder to the heard position so the new device
+                // continues from there instead of skipping the dropped audio.
+                self.seek_to(heard_ms);
             }
             Err(err) => {
                 log::error!("failed to switch local FLAC audio device: {err:#}");
@@ -1529,7 +1612,8 @@ impl PlayerWorker {
         let Some(stream) = &mut self.stream else {
             return;
         };
-        let duration_ms = self.state.duration_ms.max(stream.info.duration_ms);
+        // Never seek past the audio that is actually in the file.
+        let duration_ms = stream_duration_ms(stream.info.duration_ms, self.state.duration_ms);
         let clamped_ms = if duration_ms > 0 {
             position_ms.min(duration_ms)
         } else {
@@ -1765,12 +1849,26 @@ impl PlayerWorker {
                 false
             }
             PacketResult::Skip => false,
-            PacketResult::Eof => true,
+            PacketResult::Eof => {
+                self.push_end_of_track_tail();
+                true
+            }
             PacketResult::Error(message) => {
                 self.stop_playback(Some(message));
                 false
             }
         }
+    }
+
+    /// The output limiter holds about 8 ms of audio to look ahead, so the last
+    /// decoded samples only reach the speakers if more audio follows them. Push
+    /// 10 ms of silence after the final sample so that tail is played out.
+    fn push_end_of_track_tail(&mut self) {
+        let Some(output) = &mut self.output else {
+            return;
+        };
+        let frames = output.sample_rate().max(1) as usize / 100 + 1;
+        output.push_stereo(&vec![0.0f32; frames * STEREO_CHANNELS]);
     }
 
     fn maybe_emit_position(&mut self) {
@@ -1989,11 +2087,32 @@ mod tests {
         drop_count: usize,
     }
 
+    /// Frames queued in the mock device. Like a real device it plays them out at
+    /// the device rate while it is running, and holds them while it is paused.
+    struct MockQueue {
+        frames: f64,
+        clock: Instant,
+    }
+
     struct MockOutput {
         device_sr: u32,
         volume_gain: Arc<AtomicU32>,
         log: Arc<Mutex<MockAudioLog>>,
         paused: bool,
+        queue: Mutex<MockQueue>,
+    }
+
+    impl MockOutput {
+        /// Plays out what the device has consumed since the last call.
+        fn drain(&self) {
+            let mut queue = self.queue.lock().unwrap();
+            let now = Instant::now();
+            if !self.paused {
+                let elapsed = now.duration_since(queue.clock).as_secs_f64();
+                queue.frames = (queue.frames - elapsed * f64::from(self.device_sr)).max(0.0);
+            }
+            queue.clock = now;
+        }
     }
 
     impl AudioOutput for MockOutput {
@@ -2002,19 +2121,26 @@ mod tests {
         }
 
         fn push_stereo(&mut self, samples: &[f32]) {
+            self.drain();
             let gain = f32::from_bits(self.volume_gain.load(Ordering::Relaxed));
+            self.queue.lock().unwrap().frames += (samples.len() / STEREO_CHANNELS) as f64;
             let mut log = self.log.lock().unwrap();
             log.rendered_samples
                 .extend(samples.iter().map(|&s| s * gain));
         }
 
         fn queued_frames(&self) -> u64 {
-            0
+            self.drain();
+            self.queue.lock().unwrap().frames as u64
         }
 
-        fn clear(&mut self) {}
+        fn clear(&mut self) {
+            self.drain();
+            self.queue.lock().unwrap().frames = 0.0;
+        }
 
         fn pause(&mut self) {
+            self.drain();
             if !self.paused {
                 self.paused = true;
                 self.log.lock().unwrap().pause_count += 1;
@@ -2022,6 +2148,7 @@ mod tests {
         }
 
         fn resume(&mut self) {
+            self.drain();
             if self.paused {
                 self.paused = false;
                 self.log.lock().unwrap().resume_count += 1;
@@ -2064,6 +2191,10 @@ mod tests {
                 volume_gain,
                 log: Arc::clone(&log),
                 paused: true,
+                queue: Mutex::new(MockQueue {
+                    frames: 0.0,
+                    clock: Instant::now(),
+                }),
             }))
         })
     }
@@ -2671,37 +2802,277 @@ mod tests {
         render.configure(48_000, 2);
 
         // Stereo volume ramp down from 1.0 to 0.0 over 30 ms (1440 frames at 48 kHz).
-        queue.push_stereo(&vec![1.0; 2_000 * 2]);
+        // A 0.5 level sits below the limiter's knee, so only the gain shows. The
+        // limiter's look-ahead delays every frame by LOOKAHEAD frames.
+        queue.push_stereo(&vec![0.5; 2_000 * 2]);
         volume.store(0.0f32.to_bits(), Ordering::Relaxed);
-        let mut stereo_out = vec![0.0; 1_500 * 2];
+        let mut stereo_out = vec![0.0; (LOOKAHEAD + 1_500) * 2];
         render.render(&mut stereo_out);
-        assert_eq!(stereo_out[0], 1.0);
-        assert_eq!(stereo_out[1], 1.0);
-        assert_eq!(stereo_out[1_440 * 2], 0.0);
-        assert_eq!(stereo_out[1_440 * 2 + 1], 0.0);
-        assert!(stereo_out.windows(2).all(|w| w[0] >= w[1]));
+        assert!(stereo_out[..LOOKAHEAD * 2].iter().all(|&s| s == 0.0));
+        let signal = &stereo_out[LOOKAHEAD * 2..];
+        assert!((signal[0] - 0.5).abs() < 1e-6);
+        assert!((signal[1] - 0.5).abs() < 1e-6);
+        assert_eq!(signal[1_440 * 2], 0.0);
+        assert_eq!(signal[1_440 * 2 + 1], 0.0);
+        let left: Vec<f32> = signal.iter().step_by(2).take(1_440).copied().collect();
+        assert!(left.windows(2).all(|w| w[0] >= w[1]));
 
-        // Mono device downmixes stereo L/R cleanly.
+        // Mono device downmixes the limited stereo pair to its average.
         queue.clear();
         volume.store(1.0f32.to_bits(), Ordering::Relaxed);
         render.ramp.current = 1.0;
         render.ramp.target = 1.0;
         render.ramp.remaining = 0;
         render.configure(48_000, 1);
-        queue.push_stereo(&[0.8, 0.2, -0.4, 0.4]);
-        let mut mono_out = [0.0; 2];
+        queue.push_stereo(&[0.4, 0.2].repeat(4));
+        let mut mono_out = vec![0.0; LOOKAHEAD + 4];
         render.render(&mut mono_out);
-        assert!((mono_out[0] - 0.5).abs() < 1e-6);
-        assert!(mono_out[1].abs() < 1e-6);
+        assert!(mono_out[..LOOKAHEAD].iter().all(|&s| s == 0.0));
+        for &sample in &mono_out[LOOKAHEAD..LOOKAHEAD + 4] {
+            assert!((sample - 0.3).abs() < 1e-6);
+        }
+        assert!(mono_out[LOOKAHEAD + 4..].iter().all(|&s| s == 0.0));
 
         // 4-channel device routes stereo into front L/R and zeros rear channels.
         render.configure(48_000, 4);
         queue.push_stereo(&[0.6, -0.3]);
-        let mut quad_out = [0.0; 4];
+        let mut quad_out = vec![0.0; (LOOKAHEAD + 1) * 4];
         render.render(&mut quad_out);
-        assert!((quad_out[0] - 0.6).abs() < 1e-6);
-        assert!((quad_out[1] + 0.3).abs() < 1e-6);
-        assert_eq!(quad_out[2], 0.0);
-        assert_eq!(quad_out[3], 0.0);
+        let frame = &quad_out[LOOKAHEAD * 4..];
+        assert!((frame[0] - 0.6).abs() < 1e-6);
+        assert!((frame[1] + 0.3).abs() < 1e-6);
+        assert_eq!(frame[2], 0.0);
+        assert_eq!(frame[3], 0.0);
+    }
+
+    /// The limiter's look-ahead at 48 kHz: 8 ms.
+    const LOOKAHEAD: usize = 384;
+
+    /// A stereo output at a device rate, opened with a volume gain.
+    fn open_render(sample_rate: u32, gain: f32) -> (Arc<SampleQueue>, LocalRender) {
+        let queue = SampleQueue::new(sample_rate);
+        let volume = Arc::new(AtomicU32::new(gain.to_bits()));
+        let transport = Envelope::closed(sample_rate);
+        transport.level.store(ENVELOPE_SCALE, Ordering::Relaxed);
+        transport.target.store(ENVELOPE_SCALE, Ordering::Relaxed);
+        let mut render = LocalRender::new(Arc::clone(&queue), volume, transport);
+        render.configure(sample_rate, 2);
+        (queue, render)
+    }
+
+    #[test]
+    fn surround_downmix_folds_centre_and_rear_at_minus_3_db_and_drops_lfe() {
+        let minus_3_db = DOWNMIX_MINUS_3_DB;
+        assert!((minus_3_db - 0.707).abs() < 1e-3, "-3 dB is about 0.707");
+
+        // A centre-only 5.1 frame lands equally in both outputs; the LFE is gone.
+        let (left, right) = fold_frame_to_stereo(&[0.0, 0.0, 1.0, 0.9, 0.0, 0.0]);
+        assert!((left - minus_3_db).abs() < 1e-12);
+        assert!((right - minus_3_db).abs() < 1e-12);
+
+        // A rear-left-only frame reaches the left output only, at -3 dB.
+        let (left, right) = fold_frame_to_stereo(&[0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+        assert!((left - minus_3_db).abs() < 1e-12);
+        assert!(right.abs() < 1e-12);
+
+        // Front channels pass through unchanged.
+        let (left, right) = fold_frame_to_stereo(&[0.3, -0.2, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!((left, right), (0.3, -0.2));
+
+        // Quad (front L/R, rear L/R): the rear pair folds in at -3 dB.
+        let (left, right) = fold_frame_to_stereo(&[0.0, 0.0, 1.0, 1.0]);
+        assert!((left - minus_3_db).abs() < 1e-12);
+        assert!((right - minus_3_db).abs() < 1e-12);
+
+        // The interleaved converter applies the same fold frame by frame.
+        let mut out = Vec::new();
+        to_interleaved_stereo_f64(
+            &[0.0, 0.0, 1.0, 0.9, 0.0, 0.0, 0.3, -0.2, 0.0, 0.0, 0.0, 0.0],
+            6,
+            &mut out,
+        );
+        assert_eq!(out.len(), 4);
+        assert!((out[0] - minus_3_db).abs() < 1e-12);
+        assert!((out[1] - minus_3_db).abs() < 1e-12);
+        assert_eq!((out[2], out[3]), (0.3, -0.2));
+    }
+
+    #[test]
+    fn quiet_playback_is_not_compressed_by_the_output_limiter() {
+        // A loud decoded signal (+12 dB after EQ) at 25% volume is 0.0625 at the
+        // device: far below full scale, so it must come out untouched. A limiter
+        // ahead of the volume would have squashed the 4.0 first.
+        let gain = volume_gain(25, false);
+        let (queue, mut render) = open_render(48_000, gain);
+        queue.push_stereo(&vec![4.0; 1_000 * 2]);
+        let mut out = vec![0.0f32; (LOOKAHEAD + 1_000) * 2];
+        render.render(&mut out);
+        let steady = &out[(LOOKAHEAD + 100) * 2..(LOOKAHEAD + 900) * 2];
+        assert!(
+            steady.iter().all(|&s| (s - 4.0 * gain).abs() < 1e-6),
+            "quiet output must be exactly the volume-scaled input"
+        );
+    }
+
+    #[test]
+    fn the_output_limiter_holds_loud_output_below_full_scale() {
+        // At full volume the signal reaches the speakers, so it is limited.
+        let (queue, mut render) = open_render(48_000, volume_gain(100, false));
+        queue.push_stereo(&vec![4.0; 1_000 * 2]);
+        let mut out = vec![0.0f32; (LOOKAHEAD + 1_000) * 2];
+        render.render(&mut out);
+        let peak = out.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(peak <= 1.0, "nothing may leave above full scale: {peak}");
+        assert!(peak > 0.85, "and it really was limited: {peak}");
+    }
+
+    #[test]
+    fn the_visualiser_tap_is_identical_whatever_the_volume() {
+        let input: Vec<f64> = (0..4_096)
+            .flat_map(|i| {
+                let s = 0.5 * (i as f64 * 0.05).sin();
+                [s, s]
+            })
+            .collect();
+        let tap_after_render = |volume_percent: u8| {
+            let tap = AudioTap::new();
+            let mut pipeline =
+                AudioPipeline::new(crate::eq::shared(), Arc::clone(&tap), 44_100, 44_100);
+            let mut stereo = input.clone();
+            let processed = pipeline.process_stereo_f64(&mut stereo);
+            let (queue, mut render) = open_render(44_100, volume_gain(volume_percent, false));
+            queue.push_stereo(&processed);
+            let mut out = vec![0.0f32; processed.len()];
+            render.render(&mut out);
+            (tap.window(256, 0), out)
+        };
+        let (tap_silent, out_silent) = tap_after_render(0);
+        let (tap_loud, out_loud) = tap_after_render(100);
+        assert_eq!(tap_silent, tap_loud, "volume must not move the visualiser");
+        assert!(tap_loud.iter().any(|&s| s.abs() > 0.1));
+        assert!(out_silent.iter().all(|&s| s == 0.0));
+        assert!(out_loud.iter().any(|&s| s.abs() > 0.1));
+    }
+
+    /// A worker already playing `track` on a mock device, driven step by step
+    /// from the test thread instead of through its command loop.
+    fn mock_worker(log: Arc<Mutex<MockAudioLog>>, track: LocalFlacTrack) -> PlayerWorker {
+        let mut worker = PlayerWorker::new(
+            crate::eq::shared(),
+            AudioTap::new(),
+            None,
+            100,
+            Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            Arc::new(Mutex::new(LocalFlacState::default())),
+            Arc::new(|_: LocalFlacState| {}),
+            mock_opener(None, log),
+        );
+        worker.handle_command(Command::PlayTrack {
+            track: Box::new(track.clone()),
+            queue: vec![track],
+            start_index: 0,
+        });
+        worker
+    }
+
+    #[test]
+    fn seek_past_the_end_of_the_file_is_clamped_to_the_file_length() {
+        let dir = temp_dir("seek-clamp");
+        // About one second of audio, but the library says ten.
+        let path = write_test_flac(&dir, "short.flac", 44_100, 2, 16, 512 * 86, 440.0);
+        let track = LocalFlacTrack {
+            path,
+            duration_ms: 10_000,
+            ..LocalFlacTrack::default()
+        };
+        let log = Arc::new(Mutex::new(MockAudioLog::default()));
+        let mut worker = mock_worker(log, track);
+        let file_ms = frames_to_ms(512 * 86, 44_100);
+        assert_eq!(worker.state.duration_ms, file_ms);
+
+        worker.seek_to(9_000);
+        assert!(
+            worker.state.position_ms <= file_ms,
+            "seek landed at {} ms, past the {file_ms} ms file",
+            worker.state.position_ms
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn switching_device_mid_track_continues_from_what_was_heard() {
+        let dir = temp_dir("device-switch");
+        let path = write_test_flac(&dir, "switch.flac", 44_100, 2, 16, 512 * 300, 440.0);
+        let track = LocalFlacTrack {
+            path,
+            ..LocalFlacTrack::default()
+        };
+        let log = Arc::new(Mutex::new(MockAudioLog::default()));
+        let mut worker = mock_worker(Arc::clone(&log), track);
+
+        // Decode ahead until the device queue is full.
+        for _ in 0..1_000 {
+            if worker
+                .output
+                .as_ref()
+                .is_some_and(|out| out.queued_frames() >= 8_000)
+            {
+                break;
+            }
+            worker.step_playback();
+        }
+        let queued = worker.output.as_ref().unwrap().queued_frames();
+        assert!(queued >= 8_000, "the mock device must hold real frames");
+        let heard_before = worker.current_position_ms();
+        assert!(heard_before < 50, "almost nothing is heard yet");
+
+        worker.handle_command(Command::SetAudioDevice {
+            device: Some("headphones".into()),
+            buffer_ms: 80,
+        });
+        assert_eq!(log.lock().unwrap().opened_requests.len(), 2);
+        let heard_after = worker.current_position_ms();
+        assert!(
+            heard_after <= heard_before + 50,
+            "the new device must not skip the {queued} queued frames: {heard_after} ms"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_track_ends_with_silence_that_lets_the_limiter_tail_play_out() {
+        let dir = temp_dir("eof-tail");
+        let path = write_test_flac(&dir, "tail.flac", 44_100, 2, 16, 512 * 20, 440.0);
+        let track = LocalFlacTrack {
+            path,
+            ..LocalFlacTrack::default()
+        };
+        let log = Arc::new(Mutex::new(MockAudioLog::default()));
+        let mut worker = mock_worker(Arc::clone(&log), track);
+
+        for _ in 0..100_000 {
+            if worker.stream.as_ref().is_some_and(|s| s.eof) {
+                break;
+            }
+            if worker.step_playback() {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert!(worker.stream.as_ref().is_some_and(|s| s.eof));
+
+        let log = log.lock().unwrap();
+        let rendered = &log.rendered_samples;
+        let tail = 2 * (44_100 / 100 + 1);
+        assert!(
+            rendered[rendered.len() - tail..].iter().all(|&s| s == 0.0),
+            "the track must end with silence after its last sample"
+        );
+        assert!(
+            rendered[rendered.len() - tail - 882..rendered.len() - tail]
+                .iter()
+                .any(|&s| s.abs() > 1e-3),
+            "the audio itself comes before that silence"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

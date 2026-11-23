@@ -515,6 +515,12 @@ fn now_playing_block(app: &mut App, ui: &mut egui::Ui, region: Rect, now: Option
             .x
             + 18.0
     });
+    let title_width = ui
+        .painter()
+        .layout_no_wrap(now.title.clone(), theme::medium(14.0), palette.text)
+        .size()
+        .x;
+    let badge_fits = flac_badge_fits(title_width, flac_badge_width, text_width);
     let displayed_text_width: f32 = {
         let title =
             ui.painter()
@@ -542,7 +548,7 @@ fn now_playing_block(app: &mut App, ui: &mut egui::Ui, region: Rect, now: Option
             ui.spacing_mut().item_spacing.x = 6.0;
             let resp =
                 theme::link(ui, &now.title, theme::medium(14.0), palette.text).interact(drag_sense);
-            if app.local_flac.active {
+            if app.local_flac.active && badge_fits {
                 super::sync::player_bar_lossless_badge(app, ui);
             }
             resp
@@ -968,6 +974,13 @@ fn full_screen_button_fits(room: f32) -> bool {
     room >= EXTRAS_WIDTH + 18.0 + theme::ICON_BUTTON_PAD + 6.0 + TRANSPORT_GAP
 }
 
+/// Whether the lossless badge fits on the title's line, after the title and
+/// its 6 point gap, within `available` points. A badge that does not fit is
+/// hidden rather than cut off in the middle.
+fn flac_badge_fits(title_width: f32, badge_width: f32, available: f32) -> bool {
+    badge_width <= 0.0 || title_width + 6.0 + badge_width <= available
+}
+
 fn extras(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, transport_right: f32) {
     let palette = app.palette;
     ui.spacing_mut().item_spacing.x = 6.0;
@@ -1139,6 +1152,32 @@ fn extras(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, transport_
         .clicked()
     {
         app.actions.push(Action::ToggleFriendsPanel);
+    }
+}
+
+#[cfg(test)]
+mod flac_badge_fit_tests {
+    use super::flac_badge_fits;
+
+    #[test]
+    fn no_badge_always_fits() {
+        assert!(flac_badge_fits(400.0, 0.0, 10.0));
+    }
+
+    #[test]
+    fn badge_after_a_short_title_is_shown() {
+        assert!(flac_badge_fits(100.0, 80.0, 200.0));
+    }
+
+    #[test]
+    fn badge_that_would_be_cut_off_is_hidden() {
+        // The title, the gap and the badge need 186 points, but only 180 are free.
+        assert!(!flac_badge_fits(100.0, 80.0, 180.0));
+    }
+
+    #[test]
+    fn badge_that_exactly_fits_is_shown() {
+        assert!(flac_badge_fits(100.0, 80.0, 186.0));
     }
 }
 

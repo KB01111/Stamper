@@ -1,13 +1,23 @@
 //! Playlist polling watcher that detects new additions and wakes the sync queue.
 
 use crate::store::SyncStore;
-use crate::{Query, Result};
+use crate::{Query, Result, SyncError};
 use async_trait::async_trait;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, watch};
+
+/// Shortest base polling interval. Shorter configured intervals are raised to this
+/// before jitter is applied, so a zero or tiny interval cannot spin the store and API.
+const MIN_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Longest a single playlist fetch may run before that playlist fails for this pass.
+const PLAYLIST_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Delay after the first failed poll pass. It doubles on each consecutive failure.
+const ERROR_BACKOFF_INITIAL: Duration = Duration::from_secs(5);
+/// Upper bound for the delay between retries after failed poll passes.
+const ERROR_BACKOFF_MAX: Duration = Duration::from_secs(300);
 
 /// Track metadata returned by a [`PlaylistSource`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +57,13 @@ impl PlaylistTrack {
 #[async_trait]
 pub trait PlaylistSource: Send + Sync {
     async fn fetch_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<PlaylistTrack>>;
+
+    /// The account the source reads playlists for, or `None` when it has
+    /// none. The caller keeps sync state per account and clears it when this
+    /// changes. Sources without accounts keep the default.
+    fn account_key(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Configuration for [`PlaylistWatcher`].
@@ -69,18 +86,21 @@ impl Default for WatcherConfig {
 
 impl WatcherConfig {
     /// Computes the next sleep interval with uniform random jitter within
-    /// `poll_interval * (1 - jitter_fraction) ..= poll_interval * (1 + jitter_fraction)`.
+    /// `base * (1 - jitter_fraction) ..= base * (1 + jitter_fraction)`, where `base` is
+    /// `poll_interval` raised to at least [`MIN_POLL_INTERVAL`]. A non-finite
+    /// `jitter_fraction` is treated as zero.
     pub fn jittered_interval(&self) -> Duration {
-        let base_secs = self.poll_interval.as_secs_f64();
-        if base_secs <= 0.0 {
-            return Duration::ZERO;
-        }
-        let jitter = self.jitter_fraction.clamp(0.0, 0.5);
+        let base = self.poll_interval.max(MIN_POLL_INTERVAL);
+        let jitter = if self.jitter_fraction.is_finite() {
+            self.jitter_fraction.clamp(0.0, 0.5)
+        } else {
+            0.0
+        };
         if jitter == 0.0 {
-            return self.poll_interval;
+            return base;
         }
         let factor: f64 = rand::rng().random_range((1.0 - jitter)..=(1.0 + jitter));
-        Duration::from_secs_f64((base_secs * factor).max(0.0))
+        Duration::try_from_secs_f64(base.as_secs_f64() * factor).unwrap_or(base)
     }
 }
 
@@ -100,6 +120,12 @@ pub struct PlaylistWatcher {
     queue_notify: Arc<Notify>,
     wake_poll: Arc<Notify>,
     config: WatcherConfig,
+    /// Upper bound for one playlist fetch; a timed-out playlist fails for this pass only.
+    playlist_fetch_timeout: Duration,
+    /// First retry delay after a failed poll pass.
+    error_backoff_initial: Duration,
+    /// Cap for the retry delay after repeated failed poll passes.
+    error_backoff_max: Duration,
 }
 
 impl std::fmt::Debug for PlaylistWatcher {
@@ -124,6 +150,9 @@ impl PlaylistWatcher {
             queue_notify,
             wake_poll: Arc::new(Notify::new()),
             config,
+            playlist_fetch_timeout: PLAYLIST_FETCH_TIMEOUT,
+            error_backoff_initial: ERROR_BACKOFF_INITIAL,
+            error_backoff_max: ERROR_BACKOFF_MAX,
         }
     }
 
@@ -138,11 +167,14 @@ impl PlaylistWatcher {
         let mut report = PollReport::default();
 
         for playlist in enabled {
-            match self.poll_single_playlist(&playlist.playlist_id).await {
-                Ok(added) => {
-                    report.playlists_polled += 1;
-                    report.enqueued_tracks += added;
-                }
+            // Count inserts even when the playlist fails later, because those rows exist.
+            let mut added = 0usize;
+            let outcome = self
+                .poll_single_playlist(&playlist.playlist_id, &mut added)
+                .await;
+            report.enqueued_tracks += added;
+            match outcome {
+                Ok(()) => report.playlists_polled += 1,
                 Err(err) => {
                     log::warn!(
                         "spotisync watcher failed to poll playlist '{}': {err}",
@@ -155,10 +187,6 @@ impl PlaylistWatcher {
             }
         }
 
-        if report.enqueued_tracks > 0 {
-            self.queue_notify.notify_one();
-        }
-
         Ok(report)
     }
 
@@ -168,39 +196,65 @@ impl PlaylistWatcher {
         if !enabled.iter().any(|p| p.playlist_id == playlist_id) {
             return Ok(0);
         }
-        let added = self.poll_single_playlist(playlist_id).await?;
-        if added > 0 {
-            self.queue_notify.notify_one();
-        }
+        let mut added = 0usize;
+        self.poll_single_playlist(playlist_id, &mut added).await?;
         Ok(added)
     }
 
     /// Runs the polling loop with jittered intervals until `shutdown` becomes `true`.
+    ///
+    /// A failed poll pass is logged and retried after an exponential backoff, which
+    /// resets after the next successful pass. Shutdown and [`Self::trigger_poll`]
+    /// interrupt both the pass and the wait between passes.
     pub async fn run_until_shutdown(&self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+        let mut next_error_delay = self.error_backoff_initial;
         loop {
             if *shutdown.borrow() {
                 return Ok(());
             }
 
-            let _ = self.poll_once().await?;
+            let pass = tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown) => return Ok(()),
+                pass = self.poll_once() => pass,
+            };
 
-            let sleep_dur = self.config.jittered_interval();
-            tokio::select! {
-                _ = tokio::time::sleep(sleep_dur) => {}
-                _ = self.wake_poll.notified() => {}
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return Ok(());
-                    }
+            let wait = match pass {
+                Ok(_) => {
+                    next_error_delay = self.error_backoff_initial;
+                    self.config.jittered_interval()
                 }
+                Err(err) => {
+                    let delay = next_error_delay.min(self.error_backoff_max);
+                    next_error_delay = next_backoff(delay, self.error_backoff_max);
+                    log::warn!("spotisync watcher poll pass failed, retrying in {delay:?}: {err}");
+                    delay
+                }
+            };
+
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown) => return Ok(()),
+                _ = self.wake_poll.notified() => {}
+                _ = tokio::time::sleep(wait) => {}
             }
         }
     }
 
-    async fn poll_single_playlist(&self, playlist_id: &str) -> Result<usize> {
-        let tracks = self.source.fetch_playlist_tracks(playlist_id).await?;
+    /// Polls one playlist. Each inserted row is counted into `added` and wakes the queue
+    /// immediately, so rows stay announced even if a later step of this poll fails.
+    async fn poll_single_playlist(&self, playlist_id: &str, added: &mut usize) -> Result<()> {
+        let fetch = self.source.fetch_playlist_tracks(playlist_id);
+        let tracks = match tokio::time::timeout(self.playlist_fetch_timeout, fetch).await {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                return Err(SyncError::Provider {
+                    provider: "playlist".to_string(),
+                    message: format!("fetch timed out after {:?}", self.playlist_fetch_timeout),
+                });
+            }
+        };
         let existing = self.store.existing_track_ids(playlist_id)?;
-        let mut added = 0usize;
 
         for track in tracks {
             if existing.contains(&track.track_id) {
@@ -211,14 +265,33 @@ impl PlaylistWatcher {
                 .store
                 .enqueue_track(playlist_id, &track.track_id, &query)?
             {
-                added += 1;
+                *added += 1;
+                self.queue_notify.notify_one();
             }
         }
 
         self.store
             .mark_playlist_polled(playlist_id, now_unix_secs())?;
-        Ok(added)
+        Ok(())
     }
+}
+
+/// Resolves once shutdown is requested. A dropped sender also counts as shutdown.
+/// Cancel-safe: dropping the returned future loses no state.
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Doubles a retry delay, capped at `max`.
+fn next_backoff(current: Duration, max: Duration) -> Duration {
+    current.saturating_mul(2).min(max)
 }
 
 fn now_unix_secs() -> i64 {
@@ -536,5 +609,351 @@ mod tests {
         assert_eq!(provider.fetches.load(Ordering::SeqCst), 1);
         let item = store.get_item("pl1", "tr_wake").unwrap().unwrap();
         assert_eq!(item.status, SyncStatus::Done);
+    }
+
+    /// Polls `cond` every few milliseconds for up to five seconds.
+    async fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !cond() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    #[test]
+    fn zero_poll_interval_is_raised_to_the_floor_before_jitter() {
+        let cfg = WatcherConfig {
+            poll_interval: Duration::ZERO,
+            jitter_fraction: 0.15,
+        };
+        for _ in 0..100 {
+            let d = cfg.jittered_interval();
+            assert!(d >= Duration::from_millis(4_249), "too short: {d:?}");
+            assert!(d <= Duration::from_millis(5_751), "too long: {d:?}");
+        }
+
+        let no_jitter = WatcherConfig {
+            poll_interval: Duration::ZERO,
+            jitter_fraction: 0.0,
+        };
+        assert_eq!(no_jitter.jittered_interval(), MIN_POLL_INTERVAL);
+    }
+
+    #[test]
+    fn non_finite_jitter_fraction_yields_the_exact_base_interval() {
+        for jitter in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let cfg = WatcherConfig {
+                poll_interval: Duration::from_secs(60),
+                jitter_fraction: jitter,
+            };
+            assert_eq!(
+                cfg.jittered_interval(),
+                Duration::from_secs(60),
+                "jitter {jitter}"
+            );
+        }
+    }
+
+    #[test]
+    fn huge_poll_interval_with_jitter_does_not_panic() {
+        let cfg = WatcherConfig {
+            poll_interval: Duration::MAX,
+            jitter_fraction: 0.5,
+        };
+        for _ in 0..100 {
+            let _ = cfg.jittered_interval();
+        }
+    }
+
+    #[test]
+    fn retry_backoff_doubles_and_caps_at_five_minutes() {
+        let mut delay = ERROR_BACKOFF_INITIAL;
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            seen.push(delay.as_secs());
+            delay = next_backoff(delay, ERROR_BACKOFF_MAX);
+        }
+        assert_eq!(seen, [5, 10, 20, 40, 80, 160, 300, 300]);
+    }
+
+    #[tokio::test]
+    async fn run_until_shutdown_returns_promptly_when_idle() {
+        let store = SyncStore::open_in_memory().unwrap();
+        let source = Arc::new(FakePlaylistSource::new());
+        let watcher = PlaylistWatcher::new(
+            store,
+            source,
+            Arc::new(Notify::new()),
+            WatcherConfig::default(),
+        );
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let loop_watcher = watcher.clone();
+        let handle =
+            tokio::spawn(async move { loop_watcher.run_until_shutdown(shutdown_rx).await });
+
+        // The first pass finishes and the loop sleeps for about a minute.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = shutdown_tx.send(true);
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("idle loop should stop promptly")
+            .unwrap();
+        assert!(result.is_ok());
+    }
+
+    /// A source whose fetch never completes.
+    struct HangingSource;
+
+    #[async_trait]
+    impl PlaylistSource for HangingSource {
+        async fn fetch_playlist_tracks(&self, _playlist_id: &str) -> Result<Vec<PlaylistTrack>> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn run_until_shutdown_returns_promptly_mid_fetch() {
+        let store = SyncStore::open_in_memory().unwrap();
+        store.set_playlist_enabled("pl1", "Stuck", true).unwrap();
+        let watcher = PlaylistWatcher::new(
+            store,
+            Arc::new(HangingSource),
+            Arc::new(Notify::new()),
+            WatcherConfig::default(),
+        );
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let loop_watcher = watcher.clone();
+        let handle =
+            tokio::spawn(async move { loop_watcher.run_until_shutdown(shutdown_rx).await });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!handle.is_finished(), "fetch should still be in flight");
+        let _ = shutdown_tx.send(true);
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("loop stuck in a fetch should still stop promptly")
+            .unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn trigger_poll_wakes_sleeping_loop() {
+        let store = SyncStore::open_in_memory().unwrap();
+        store.set_playlist_enabled("pl1", "Wake", true).unwrap();
+        let source = Arc::new(FakePlaylistSource::new());
+        let watcher = PlaylistWatcher::new(
+            store.clone(),
+            source.clone(),
+            Arc::new(Notify::new()),
+            WatcherConfig::default(),
+        );
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let loop_watcher = watcher.clone();
+        let handle =
+            tokio::spawn(async move { loop_watcher.run_until_shutdown(shutdown_rx).await });
+
+        assert!(
+            wait_until(|| source.poll_count("pl1") == 1).await,
+            "first pass should run"
+        );
+        source.set_tracks(
+            "pl1",
+            vec![make_track("tr_trig", "Triggered", "USAA10000003")],
+        );
+        // The loop now sleeps for about a minute, so only the trigger can cause this pass.
+        watcher.trigger_poll();
+        assert!(
+            wait_until(|| !store.list_pending().unwrap().is_empty()).await,
+            "trigger should run a pass that picks up the new track"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn poll_playlist_now_polls_at_once_and_wakes_queue() {
+        let store = SyncStore::open_in_memory().unwrap();
+        store.set_playlist_enabled("pl1", "Now", true).unwrap();
+        store.set_playlist_enabled("pl_off", "Off", false).unwrap();
+        let source = Arc::new(FakePlaylistSource::new());
+        source.set_tracks("pl1", vec![make_track("tr_now", "Now", "USAA10000004")]);
+        source.set_tracks("pl_off", vec![make_track("tr_off", "Off", "USAA10000005")]);
+        let notify = Arc::new(Notify::new());
+        let watcher = PlaylistWatcher::new(
+            store.clone(),
+            source.clone(),
+            notify.clone(),
+            WatcherConfig::default(),
+        );
+
+        assert_eq!(watcher.poll_playlist_now("pl_off").await.unwrap(), 0);
+        assert_eq!(source.poll_count("pl_off"), 0);
+
+        let added = watcher.poll_playlist_now("pl1").await.unwrap();
+        assert_eq!(added, 1);
+        assert_eq!(source.poll_count("pl1"), 1);
+        assert_eq!(store.list_pending().unwrap().len(), 1);
+        tokio::time::timeout(Duration::from_secs(1), notify.notified())
+            .await
+            .expect("queue should be woken by the immediate poll");
+    }
+
+    /// A source where one playlist never answers and the others behave normally.
+    struct StallingSource {
+        stall_id: &'static str,
+        inner: FakePlaylistSource,
+    }
+
+    #[async_trait]
+    impl PlaylistSource for StallingSource {
+        async fn fetch_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<PlaylistTrack>> {
+            if playlist_id == self.stall_id {
+                return std::future::pending().await;
+            }
+            self.inner.fetch_playlist_tracks(playlist_id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_timeout_fails_only_the_stuck_playlist() {
+        let store = SyncStore::open_in_memory().unwrap();
+        store
+            .set_playlist_enabled("pl_stuck", "Stuck", true)
+            .unwrap();
+        store.set_playlist_enabled("pl_ok", "Fine", true).unwrap();
+        let inner = FakePlaylistSource::new();
+        inner.set_tracks(
+            "pl_ok",
+            vec![make_track("tr_ok", "Fine Track", "USAA10000006")],
+        );
+        let source = Arc::new(StallingSource {
+            stall_id: "pl_stuck",
+            inner,
+        });
+        let mut watcher = PlaylistWatcher::new(
+            store.clone(),
+            source,
+            Arc::new(Notify::new()),
+            WatcherConfig::default(),
+        );
+        watcher.playlist_fetch_timeout = Duration::from_millis(50);
+
+        let report = tokio::time::timeout(Duration::from_secs(5), watcher.poll_once())
+            .await
+            .expect("a stuck fetch must not hang the pass")
+            .unwrap();
+        assert_eq!(report.playlists_polled, 1);
+        assert_eq!(report.enqueued_tracks, 1);
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].0, "pl_stuck");
+        assert!(report.errors[0].1.contains("timed out"));
+        assert!(
+            store
+                .playlist_track_statuses("pl_stuck")
+                .unwrap()
+                .is_empty()
+        );
+        let pending = store.list_pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].track_id, "tr_ok");
+    }
+
+    #[tokio::test]
+    async fn insert_followed_by_failure_still_wakes_queue() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("sync.db");
+        let store = SyncStore::open(&db_path).unwrap();
+        store.set_playlist_enabled("pl1", "Partial", true).unwrap();
+        // Fail the final `mark_playlist_polled` write, after the insert has committed.
+        let side = rusqlite::Connection::open(&db_path).unwrap();
+        side.execute_batch(
+            "CREATE TRIGGER fail_poll_mark BEFORE UPDATE ON synced_playlists
+             BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END;",
+        )
+        .unwrap();
+
+        let source = Arc::new(FakePlaylistSource::new());
+        source.set_tracks(
+            "pl1",
+            vec![make_track("tr_partial", "Partial", "USAA10000007")],
+        );
+        let notify = Arc::new(Notify::new());
+        let watcher = PlaylistWatcher::new(
+            store.clone(),
+            source,
+            notify.clone(),
+            WatcherConfig::default(),
+        );
+
+        let report = watcher.poll_once().await.unwrap();
+        assert_eq!(report.playlists_polled, 0);
+        assert_eq!(
+            report.enqueued_tracks, 1,
+            "the committed insert must still be counted"
+        );
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(store.list_pending().unwrap().len(), 1);
+        tokio::time::timeout(Duration::from_secs(1), notify.notified())
+            .await
+            .expect("queue should be woken for the committed insert");
+    }
+
+    #[tokio::test]
+    async fn store_error_does_not_stop_the_loop() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("sync.db");
+        let store = SyncStore::open(&db_path).unwrap();
+        store.set_playlist_enabled("pl1", "Flaky", true).unwrap();
+        let source = Arc::new(FakePlaylistSource::new());
+        source.set_tracks("pl1", vec![make_track("tr_later", "Later", "USAA10000008")]);
+        let mut watcher = PlaylistWatcher::new(
+            store.clone(),
+            source.clone(),
+            Arc::new(Notify::new()),
+            WatcherConfig::default(),
+        );
+        watcher.error_backoff_initial = Duration::from_millis(10);
+        watcher.error_backoff_max = Duration::from_millis(40);
+
+        // Hide the table that `list_enabled_playlists` reads so every pass fails in the store.
+        let side = rusqlite::Connection::open(&db_path).unwrap();
+        side.execute_batch("ALTER TABLE synced_playlists RENAME TO synced_playlists_hidden")
+            .unwrap();
+        assert!(store.list_enabled_playlists().is_err());
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let loop_watcher = watcher.clone();
+        let handle =
+            tokio::spawn(async move { loop_watcher.run_until_shutdown(shutdown_rx).await });
+
+        // Several failed passes go by with backoff; the loop must stay alive through them.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!handle.is_finished(), "a store error must not end the loop");
+        assert_eq!(
+            source.poll_count("pl1"),
+            0,
+            "no playlist is fetched while the store is failing"
+        );
+
+        side.execute_batch("ALTER TABLE synced_playlists_hidden RENAME TO synced_playlists")
+            .unwrap();
+        watcher.trigger_poll();
+        assert!(
+            wait_until(|| !store.list_pending().unwrap().is_empty()).await,
+            "loop should recover once the store does"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("loop should stop after recovery")
+            .unwrap();
+        assert!(result.is_ok());
     }
 }
